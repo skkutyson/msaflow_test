@@ -1,0 +1,186 @@
+diff --git a/protenix/model/layer_norm/layer_norm.py b/protenix/model/layer_norm/layer_norm.py
+index 275dc33..9462d7f 100644
+--- a/protenix/model/layer_norm/layer_norm.py
++++ b/protenix/model/layer_norm/layer_norm.py
+@@ -38,32 +38,71 @@ from torch.nn.parameter import Parameter
+ 
+ 
+ current_dir = os.path.dirname(__file__)
+-build_directory = current_dir if os.access(current_dir, os.W_OK | os.X_OK) else None
+-
+-# 1. Try to load from current directory first
+-sys.path.append(current_dir)
+-
+-# 2. If it falls back to PyTorch's cache, we need to add the cache directory to sys.path
+-if build_directory is None:
+-    from torch.utils.cpp_extension import _get_build_directory
+-
+-    cache_dir = _get_build_directory("fast_layer_norm_cuda_v2", False)
+-    sys.path.append(cache_dir)
+-
+-try:
+-    fast_layer_norm_cuda_v2 = importlib.import_module("fast_layer_norm_cuda_v2")
+-except ImportError:
+-    from protenix.model.layer_norm.torch_ext_compile import compile
+-
+-    fast_layer_norm_cuda_v2 = compile(
+-        name="fast_layer_norm_cuda_v2",
+-        sources=[
+-            os.path.join(f"{current_dir}/kernel", file)
+-            for file in ["layer_norm_cuda.cpp", "layer_norm_cuda_kernel.cu"]
+-        ],
+-        extra_include_paths=[f"{current_dir}/kernel"],
+-        build_directory=build_directory,
+-    )
++
++# CUDA가 없는 노드(헤드 노드 등)에서는 컴파일하지 않음.
++# 잘못된 SM 버전으로 컴파일된 .so가 생성되는 것을 방지.
++# Import 시점이 아닌 첫 forward() 호출 시점에 lazy하게 로드하여
++# Apptainer 컨테이너 등 import 시점에 CUDA가 초기화되지 않은 환경을 지원.
++_SUPPORTED_SMS = {70, 75, 80, 86, 89, 90, 100, 120}
++fast_layer_norm_cuda_v2 = None
++_kernel_checked = False
++
++
++def _try_load_kernel() -> None:
++    """CUDA 커널을 lazy하게 로드한다. 첫 forward() 호출 시 1회만 실행."""
++    global fast_layer_norm_cuda_v2, _kernel_checked
++    if _kernel_checked:
++        return
++    _kernel_checked = True
++
++    import logging
++    logger = logging.getLogger(__name__)
++
++    if not torch.cuda.is_available():
++        logger.info(
++            "FusedLayerNorm: CUDA not available, using torch.nn.functional.layer_norm fallback"
++        )
++        return
++
++    cap = torch.cuda.get_device_capability()
++    current_sm = cap[0] * 10 + cap[1]
++
++    if current_sm not in _SUPPORTED_SMS:
++        logger.info(
++            "FusedLayerNorm: sm_%d not in supported set, using torch.nn.functional.layer_norm fallback",
++            current_sm,
++        )
++        return
++
++    build_directory = current_dir if os.access(current_dir, os.W_OK | os.X_OK) else None
++    sys.path.append(current_dir)
++
++    if build_directory is None:
++        from torch.utils.cpp_extension import _get_build_directory
++
++        cache_dir = _get_build_directory("fast_layer_norm_cuda_v2", False)
++        sys.path.append(cache_dir)
++
++    try:
++        fast_layer_norm_cuda_v2 = importlib.import_module("fast_layer_norm_cuda_v2")
++    except ImportError:
++        try:
++            from protenix.model.layer_norm.torch_ext_compile import compile
++
++            fast_layer_norm_cuda_v2 = compile(
++                name="fast_layer_norm_cuda_v2",
++                sources=[
++                    os.path.join(f"{current_dir}/kernel", file)
++                    for file in ["layer_norm_cuda.cpp", "layer_norm_cuda_kernel.cu"]
++                ],
++                extra_include_paths=[f"{current_dir}/kernel"],
++                build_directory=build_directory,
++            )
++        except Exception as e:
++            logger.warning(
++                "FusedLayerNorm: JIT compile failed (%s), using torch.nn.functional.layer_norm fallback",
++                e,
++            )
+ 
+ 
+ class FusedLayerNormAffineFunction(torch.autograd.Function):
+@@ -228,6 +267,11 @@ class FusedLayerNorm(torch.nn.Module):
+             torch.nn.init.zeros_(self.bias)
+ 
+     def forward(self, input: torch.Tensor) -> torch.Tensor:
++        _try_load_kernel()
++        if fast_layer_norm_cuda_v2 is None:
++            return torch.nn.functional.layer_norm(
++                input, self.normalized_shape, self.weight, self.bias, self.eps
++            )
+         return FusedLayerNormAffineFunction.apply(
+             input, self.weight, self.bias, self.normalized_shape, self.eps
+         )
+diff --git a/protenix/model/layer_norm/torch_ext_compile.py b/protenix/model/layer_norm/torch_ext_compile.py
+index 0f330b1..4434626 100644
+--- a/protenix/model/layer_norm/torch_ext_compile.py
++++ b/protenix/model/layer_norm/torch_ext_compile.py
+@@ -55,6 +55,7 @@ def compile(
+         ("89", "89"),
+         ("90", "90"),
+         ("100", "100"),
++        ("120", "120"),
+     ]
+     gencode_flags = []
+     for compute, sm in _wanted:
+diff --git a/protenix/model/modules/fused_ops.py b/protenix/model/modules/fused_ops.py
+index fb14537..f818a07 100644
+--- a/protenix/model/modules/fused_ops.py
++++ b/protenix/model/modules/fused_ops.py
+@@ -23,16 +23,19 @@ import os
+ 
+ import torch
+ 
+-try:
+-    import triton
+-    import triton.language as tl
+-
+-    # Setting this to True directly causes a very slight drop in foldbench performance.
+-    TRITON_FUSED_OPS_AVAILABLE = (
+-        os.environ.get("FUSED_DROPOUT_RESIDUAL", "False") == "True"
+-    )
+-except (ImportError, RuntimeError):
+-    TRITON_FUSED_OPS_AVAILABLE = False
++# Only import triton when the fused op is explicitly requested.
++# Importing triton 3.3.1 on unsupported GPU architectures (e.g., Blackwell sm_120)
++# can corrupt the CUDA context, causing torch.cuda.is_available() to return False.
++TRITON_FUSED_OPS_AVAILABLE = (
++    os.environ.get("FUSED_DROPOUT_RESIDUAL", "False") == "True"
++)
++
++if TRITON_FUSED_OPS_AVAILABLE:
++    try:
++        import triton
++        import triton.language as tl
++    except (ImportError, RuntimeError):
++        TRITON_FUSED_OPS_AVAILABLE = False
+ 
+ 
+ if TRITON_FUSED_OPS_AVAILABLE:
+diff --git a/protenix/model/modules/pairformer.py b/protenix/model/modules/pairformer.py
+index e348525..c0a6182 100644
+--- a/protenix/model/modules/pairformer.py
++++ b/protenix/model/modules/pairformer.py
+@@ -878,7 +878,7 @@ class MSAModule(nn.Module):
+             msa_feat["msa"] = torch.nn.functional.one_hot(
+                 msa_feat["msa"],
+                 num_classes=self.input_feature["msa"],
+-            )
++            ).float()  # F.one_hot returns int64; cast to float32 for subsequent cat+linear
+ 
+         target_shape = msa_feat["msa"].shape[:-1]
+         msa_sample = torch.cat(
+diff --git a/requirements.txt b/requirements.txt
+index ada5751..3320d30 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -17,7 +17,7 @@ biotite==1.4.0
+ modelcif==1.4
+ gemmi==0.6.7
+ pdbeccdutils==1.0.0
+-fair-esm==2.0.0
++fair-esm @ file:///mnt/MSA_FLOW/esm
+ scikit-learn==1.7.1
+ scikit-learn-extra==0.3.0
+ deepspeed==0.17.5

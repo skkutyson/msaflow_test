@@ -1,0 +1,10 @@
+diff --git a/esm/version.py b/esm/version.py
+index 271f36e..241acf1 100644
+--- a/esm/version.py
++++ b/esm/version.py
+@@ -3,4 +3,4 @@
+ # This source code is licensed under the MIT license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
+-version = "2.0.1"
++version = "2.0.0"
