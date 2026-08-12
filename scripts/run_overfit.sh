@@ -5,11 +5,12 @@
 # faithful Protenix embedding, then overfits the SFM decoder on that one MSA.
 # Loss should fall toward ~0 if the pipeline is correct.
 #
-# Usage:
+# Usage (a3m path as the 1st argument OR the A3M_FILE env var):
+#   bash scripts/run_overfit.sh /path/to/my_target.a3m
 #   A3M_FILE=/path/to/my_target.a3m bash scripts/run_overfit.sh
 #
 # Common overrides (env vars):
-#   A3M_FILE       (required) path to the target .a3m
+#   A3M_FILE       (required, or pass as arg 1) path to the target .a3m
 #   WORK_DIR       output root for LMDB + checkpoints   (default: <repo>/runs/overfit)
 #   PROTENIX_CKPT  Protenix checkpoint .pt              (default: <repo>/checkpoints/...)
 #   CCD_DIR        dir holding components.cif etc.      (default: $HOME/common)
@@ -22,7 +23,14 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
 # ── config ────────────────────────────────────────────────────────────────────
-A3M_FILE="${A3M_FILE:?set A3M_FILE=/path/to/target.a3m}"
+# a3m path: 1st positional arg wins, else the A3M_FILE env var, else error.
+A3M_FILE="${1:-${A3M_FILE:-}}"
+if [ -z "$A3M_FILE" ]; then
+    echo "ERROR: no target a3m given."
+    echo "  usage: bash scripts/run_overfit.sh /path/to/target.a3m"
+    echo "     or: A3M_FILE=/path/to/target.a3m bash scripts/run_overfit.sh"
+    exit 1
+fi
 WORK_DIR="${WORK_DIR:-$REPO_DIR/runs/overfit}"
 PROTENIX_CKPT="${PROTENIX_CKPT:-$REPO_DIR/checkpoints/checkpoints/protenix_base_default_v1.0.0.pt}"
 CCD_DIR="${CCD_DIR:-$HOME/common}"
