@@ -34,9 +34,11 @@ CONFIG="${CONFIG:-$REPO_DIR/msaflow/configs/decoder_overfit_single.yaml}"
 A3M_FILE="$(readlink -f "$A3M_FILE")"
 [ -f "$A3M_FILE" ] || { echo "ERROR: a3m not found: $A3M_FILE"; exit 1; }
 TARGET_ID="$(basename "$A3M_FILE" .a3m)"          # a3m stem == LMDB key
-A3M_DIR="$(dirname "$A3M_FILE")"
 LMDB="$WORK_DIR/${TARGET_ID}.lmdb"
 OUT_DIR="$WORK_DIR/decoder_${TARGET_ID}"
+# Stage just this one a3m in its own dir so build_lmdb processes ONLY the target
+# (no --protein_list / no pre-existing logs dir needed).
+STAGE_DIR="$WORK_DIR/a3m_${TARGET_ID}"
 export PROTENIX_ROOT_DIR="$(dirname "$CCD_DIR")"  # Protenix reads $PROTENIX_ROOT_DIR/common
 export CUDA_VISIBLE_DEVICES="$GPU"
 
@@ -48,7 +50,8 @@ for f in components.cif components.cif.rdkit_mol.pkl; do
 done
 command -v uv >/dev/null || { echo "ERROR: uv not found (run scripts/setup_native_uv.sh first)"; exit 1; }
 
-mkdir -p "$WORK_DIR" "$OUT_DIR"
+mkdir -p "$WORK_DIR" "$OUT_DIR" "$STAGE_DIR"
+ln -sf "$A3M_FILE" "$STAGE_DIR/${TARGET_ID}.a3m"
 
 echo "============================================================"
 echo " MSAFlow single-target OVERFIT test"
@@ -66,10 +69,9 @@ else
     echo "== [1/2] build single-target LMDB (faithful Protenix, n_cycle=$N_CYCLE) =="
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     uv run python -m msaflow.data.preprocessing \
-        --a3m_dir "$A3M_DIR" \
+        --a3m_dir "$STAGE_DIR" \
         --output "$LMDB" \
         --protenix_checkpoint "$PROTENIX_CKPT" \
-        --protein_list <(echo "$TARGET_ID") \
         --n_cycle "$N_CYCLE" \
         --map_size_gb 5 \
         --device cuda
