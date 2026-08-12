@@ -466,6 +466,15 @@ def train(cfg):
     output_dir.mkdir(parents=True, exist_ok=True)
     start_epoch, global_step = 0, 0
 
+    # Local metrics sink (wandb-independent): one JSON object per line.
+    # scripts/plot_overfit.py turns this into PNGs — works with no wandb login.
+    _metrics_path = output_dir / "metrics.jsonl"
+
+    def _log_metrics(row: dict):
+        import json
+        with open(_metrics_path, "a") as _f:
+            _f.write(json.dumps(row) + "\n")
+
     ckpt_path = output_dir / "latest.pt"
     if ckpt_path.exists() and cfg.training.resume:
         ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -633,6 +642,8 @@ def train(cfg):
                     "epoch %d | step %d | loss %.4f | lr %.2e",
                     epoch, global_step, loss.item(), lr,
                 )
+                _log_metrics({"kind": "train", "step": global_step, "epoch": epoch,
+                              "loss": loss.item(), "lr": lr})
                 if use_wandb:
                     import wandb
                     wandb.log({
@@ -674,6 +685,8 @@ def train(cfg):
                     val_metrics.get(f"{t05}/gap_frac", float("nan")),
                     val_metrics.get(f"{t05}/aa_kl_div", float("nan")),
                 )
+                _log_metrics({"kind": "val", "step": global_step, "epoch": epoch,
+                              **{k: float(v) for k, v in val_metrics.items()}})
                 if use_wandb:
                     import wandb
                     wandb.log(val_metrics, step=global_step)

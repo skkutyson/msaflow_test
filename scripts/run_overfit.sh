@@ -99,4 +99,8 @@ uv run accelerate launch \
     --output_dir "$OUT_DIR" \
     ${ALPHA:+--alpha "$ALPHA"}
 
-echo "== done: $TARGET_ID =="
+# ── 3) plot diagnostics (local PNGs, no wandb needed) ─────────────────────────
+echo "== [3/3] plotting → $OUT_DIR/*.png =="
+uv run python scripts/plot_overfit.py "$OUT_DIR" || echo "  (plot skipped)"
+
+echo "== done: $TARGET_ID  (see $OUT_DIR/train_loss.png, val_recovery.png, val_kl.png) =="
