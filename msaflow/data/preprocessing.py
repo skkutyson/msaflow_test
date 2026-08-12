@@ -476,11 +476,21 @@ def build_lmdb(
     logger.info("Found %d A3M files total", len(a3m_files))
 
     if protein_list is not None:
+        if not Path(protein_list).is_file():
+            raise FileNotFoundError(
+                f"--protein_list points to a missing file: {protein_list!r} "
+                f"(cwd={Path.cwd()}). Pass an existing file with one protein ID "
+                f"per line, or omit --protein_list to process every a3m in --a3m_dir."
+            )
         with open(protein_list) as f:
             allowed_ids = {line.strip() for line in f if line.strip()}
         a3m_files = [p for p in a3m_files if p.stem in allowed_ids]
         logger.info("Filtered to %d A3M files from protein_list (%s)",
                     len(a3m_files), protein_list)
+        if not a3m_files:
+            logger.warning("protein_list %s matched 0 of the a3m files in %s "
+                           "(check IDs match a3m filenames without .a3m)",
+                           protein_list, a3m_dir)
 
     env = lmdb.open(
         output_path,
