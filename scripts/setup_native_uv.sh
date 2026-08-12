@@ -27,14 +27,18 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 1
 fi
 
-# 1) Point the container path at this clone (no-op if already correct)
+# 1) Point the container path at this clone (no-op if already correct).
+#    Mark rewritten tracked files skip-worktree so these node-local edits don't
+#    show up as changes and don't block/conflict on future `git pull`.
 if [ "$REPO_DIR" != "$OLD" ]; then
     for f in pyproject.toml uv.lock Protenix/requirements.txt; do
         if grep -q "$OLD" "$f" 2>/dev/null; then
             sed -i "s#${OLD}#${REPO_DIR}#g" "$f"
-            echo "  patched   : $f"
+            git update-index --skip-worktree "$f" 2>/dev/null || true
+            echo "  patched + skip-worktree : $f"
         fi
     done
+    echo "  (to let these files update from git again: git update-index --no-skip-worktree <file>)"
 else
     echo "  (running at $OLD — no path rewrite needed)"
 fi
