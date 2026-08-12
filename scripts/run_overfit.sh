@@ -37,13 +37,16 @@ CCD_DIR="${CCD_DIR:-$HOME/common}"
 N_CYCLE="${N_CYCLE:-1}"
 GPU="${GPU:-0}"
 CONFIG="${CONFIG:-$REPO_DIR/msaflow/configs/decoder_overfit_single.yaml}"
+ALPHA="${ALPHA:-}"                # α-geometry: empty=use config (0.0), 0.5=α-Flow (L⁴ sphere)
 
 # ── derive ────────────────────────────────────────────────────────────────────
 A3M_FILE="$(readlink -f "$A3M_FILE")"
 [ -f "$A3M_FILE" ] || { echo "ERROR: a3m not found: $A3M_FILE"; exit 1; }
 TARGET_ID="$(basename "$A3M_FILE" .a3m)"          # a3m stem == LMDB key
 LMDB="$WORK_DIR/${TARGET_ID}.lmdb"
-OUT_DIR="$WORK_DIR/decoder_${TARGET_ID}"
+# separate output per α so α=0 and α=0.5 runs don't overwrite each other
+ALPHA_TAG="${ALPHA:+_a${ALPHA}}"
+OUT_DIR="$WORK_DIR/decoder_${TARGET_ID}${ALPHA_TAG}"
 # Stage just this one a3m in its own dir so build_lmdb processes ONLY the target
 # (no --protein_list / no pre-existing logs dir needed).
 STAGE_DIR="$WORK_DIR/a3m_${TARGET_ID}"
@@ -68,6 +71,7 @@ echo "   a3m    : $A3M_FILE"
 echo "   lmdb   : $LMDB"
 echo "   out    : $OUT_DIR"
 echo "   n_cycle: $N_CYCLE   gpu: $GPU   ccd: $CCD_DIR"
+echo "   alpha  : ${ALPHA:-config default (0.0)}"
 echo "============================================================"
 
 # ── 1) build single-target LMDB (skip if present) ─────────────────────────────
@@ -86,12 +90,13 @@ else
 fi
 
 # ── 2) overfit the decoder on that one MSA ────────────────────────────────────
-echo "== [2/2] overfit decoder =="
+echo "== [2/2] overfit decoder (alpha=${ALPHA:-config default}) =="
 uv run accelerate launch \
     --config_file "$REPO_DIR/msaflow/configs/accelerate_1gpu.yaml" \
     msaflow/training/train_decoder.py \
     --config "$CONFIG" \
     --lmdb_path "$LMDB" \
-    --output_dir "$OUT_DIR"
+    --output_dir "$OUT_DIR" \
+    ${ALPHA:+--alpha "$ALPHA"}
 
 echo "== done: $TARGET_ID =="

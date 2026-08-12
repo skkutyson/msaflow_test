@@ -745,6 +745,8 @@ def main():
     parser.add_argument("--lmdb_path",     default=None,   help="Override data.lmdb_path")
     parser.add_argument("--val_lmdb_path", default=None,   help="Override data.val_lmdb_path")
     parser.add_argument("--output_dir",    default=None,   help="Override training.output_dir")
+    parser.add_argument("--alpha",         default=None, type=float,
+                        help="Override model.alpha (α-geometry; 0.0=L² sphere/SFM, 0.5=L⁴/α-Flow)")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -754,6 +756,8 @@ def main():
         cfg.data.val_lmdb_path = args.val_lmdb_path
     if args.output_dir:
         cfg.training.output_dir = args.output_dir
+    if args.alpha is not None:
+        cfg.model.alpha = args.alpha
 
     train(cfg)
 
