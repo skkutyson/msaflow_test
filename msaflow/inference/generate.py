@@ -29,10 +29,9 @@ import numpy as np
 
 from msaflow.models.sfm_decoder import SFMDecoder
 from msaflow.models.latent_fm import LatentFMEncoder, sample_msa_embeddings
-from msaflow.utils.spherical import sample_sphere_noise, euler_step_sphere, decode_sequences
+from msaflow.utils.alpha_geometry import geometry_ops
 from msaflow.data.preprocessing import (
     AA_LIST,
-    VOCAB_SIZE,
     parse_a3m,
     filter_msa,
     extract_msa_embedding_protenix,
@@ -46,7 +45,8 @@ logger = logging.getLogger(__name__)
 # Model loading helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_sfm_decoder(checkpoint_path: str, device: torch.device) -> SFMDecoder:
+def load_sfm_decoder(checkpoint_path: str, device: torch.device,
+                     alpha: Optional[float] = None) -> SFMDecoder:
     ckpt = torch.load(checkpoint_path, map_location=device)
     state = ckpt.get("model", ckpt)
     # Infer vocab_size and msa_dim from checkpoint weights
@@ -54,13 +54,20 @@ def load_sfm_decoder(checkpoint_path: str, device: torch.device) -> SFMDecoder:
     msa_dim = state["cond_proj.weight"].shape[1]
     hidden_size = state["input_proj.weight"].shape[0]
     depth = sum(1 for k in state if k.startswith("blocks.") and k.endswith(".mlp.0.weight"))
+    # α parameterises the Lᵖ geometry but is not a weight, so it must come from the
+    # checkpoint metadata (saved by train_decoder). Explicit `alpha` arg overrides;
+    # otherwise fall back to the stored value, then 0.0 (legacy L² sphere / SFM).
+    if alpha is None:
+        alpha = float(ckpt["alpha"]) if isinstance(ckpt, dict) and "alpha" in ckpt else 0.0
     model = SFMDecoder(
         vocab_size=vocab_size,
         msa_dim=msa_dim,
         hidden_size=hidden_size,
         depth=depth,
+        alpha=alpha,
     )
     model.load_state_dict(state)
+    logger.info("Loaded SFM decoder  (alpha=%.2f, p=%.2f)", alpha, 2.0 / (1.0 - alpha))
     return model.eval().to(device)
 
 
@@ -83,15 +90,22 @@ def load_esm2(device: torch.device):
     return model.eval().to(device), alphabet
 
 
-def load_protenix(checkpoint_path: str, device: torch.device):
-    sys.path.insert(0, str(Path(__file__).parents[3] / "Protenix"))
-    from protenix.model.protenix import Protenix
-    from omegaconf import OmegaConf
-    cfg = OmegaConf.load(Path(checkpoint_path).parent / "config.yaml")
-    model = Protenix(cfg).eval().to(device)
-    state = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state["model"], strict=False)
-    return model
+def load_msa_module(checkpoint_path: str, device: torch.device):
+    """Load the FULL Protenix model for faithful MSA-embedding extraction.
+
+    The faithful path (real featurization + get_pairformer_output recycling,
+    see preprocessing.extract_msa_embedding_protenix) needs the whole trunk,
+    not just the MSAModule — the name is kept for backward compatibility.
+    Requires CCD files in $PROTENIX_ROOT_DIR/common (default: $HOME/common).
+    """
+    sys.path.insert(0, str(Path(__file__).parents[2] / "Protenix"))
+    from msaflow.data.preprocessing import load_protenix_model
+    return load_protenix_model(checkpoint_path, device)
+
+
+# Alias: fold_benchmark and other callers refer to the AF3 encoder loader as
+# `load_protenix` (it is the "Protenix encoder" from their point of view).
+load_protenix = load_msa_module
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -127,13 +141,18 @@ def decode_from_embedding(
     if device is None:
         device = next(decoder.parameters()).device
 
+    # Geometry follows the decoder's own α (p = 2/(1-α)): α=0 → L² sphere (SFM),
+    # α=0.5 → L⁴ sphere. This makes decoding consistent with how the model trained.
+    noise_fn, step_fn, decode_fn = geometry_ops(getattr(decoder, "alpha", 0.0))
+
     L, msa_dim = m_seq.shape
-    logger.info("decode_from_embedding  ----- n_seqs=%d  n_steps=%d  L=%d", n_seqs, n_steps, L)
+    logger.info("decode_from_embedding  ----- n_seqs=%d  n_steps=%d  L=%d  alpha=%.2f",
+                n_seqs, n_steps, L, getattr(decoder, "alpha", 0.0))
     m_seq_batch = m_seq.unsqueeze(0).expand(n_seqs, -1, -1).to(device)  # (n, L, msa_dim)
 
     # Start from noise on the sphere — float32 for numerical stability in sphere ops.
     # Using m_seq.dtype (bf16 when latent FM output) would degrade ODE integration precision.
-    x_t = sample_sphere_noise((n_seqs, L, decoder.vocab_size), device=device, dtype=torch.float32)
+    x_t = noise_fn((n_seqs, L, decoder.vocab_size), device, torch.float32)
 
     dt = 1.0 / n_steps
 
@@ -142,15 +161,12 @@ def decode_from_embedding(
         t_val = step * dt
         t = torch.full((n_seqs,), t_val, device=device, dtype=m_seq.dtype)
         v = decoder(x_t, m_seq_batch, t)               # (n, L, V)
-        x_t = euler_step_sphere(x_t, v, dt)
+        x_t = step_fn(x_t, v, dt)
 
     # Decode: x_1 → token ids
-    token_ids = decode_sequences(x_t, temperature=temperature)   # (n, L)
+    token_ids = decode_fn(x_t, temperature)   # (n, L)
 
-    seqs = []
-    for row in token_ids:
-        seq = "".join(AA_LIST[i] for i in row.tolist())
-        seqs.append(seq)
+    seqs = ["".join(AA_LIST[i] for i in row.tolist()) for row in token_ids]
     logger.info("decode_from_embedding complete  ----- generated %d sequences", len(seqs))
     return seqs
 
@@ -162,23 +178,27 @@ def decode_from_embedding(
 def reconstruct(
     msa_seqs: list[str],
     decoder: SFMDecoder,
-    protenix_model,
+    msa_module,
     n_seqs: int = 32,
     n_steps: int = 100,
+    temperature: float = 0.0,
+    seed: int = 42,
     device: torch.device = None,
 ) -> list[str]:
     """
     MSA Compression & Reconstruction.
 
-    Encode the MSA with Protenix → decode with SFM decoder.
+    Encode the MSA with Protenix MSAModule → decode with SFM decoder.
 
     Args:
-        msa_seqs:        List of aligned sequences (all same length).
-        decoder:         Trained SFMDecoder.
-        protenix_model:  Loaded Protenix model.
-        n_seqs:          Number of sequences to generate.
-        n_steps:         ODE steps.
-        device:          Compute device.
+        msa_seqs:    List of aligned sequences (all same length).
+        decoder:     Trained SFMDecoder.
+        msa_module:  Loaded Protenix MSAModule.
+        n_seqs:      Number of sequences to generate.
+        n_steps:     ODE steps.
+        temperature: Decoding temperature (0.0 = argmax).
+        seed:        Random seed for noise sampling.
+        device:      Compute device.
 
     Returns:
         generated sequences (gaps preserved from the MSA alignment length).
@@ -186,9 +206,12 @@ def reconstruct(
     if device is None:
         device = next(decoder.parameters()).device
 
-    logger.info("Reconstruction mode  ----- MSA depth=%d  L=%d", len(msa_seqs), len(msa_seqs[0]))
-    m_seq = extract_msa_embedding_protenix(msa_seqs, protenix_model, device)  # (L, 128)
-    return decode_from_embedding(decoder, m_seq, n_seqs=n_seqs, n_steps=n_steps, device=device)
+    torch.manual_seed(seed)
+    logger.info("Reconstruction mode  ----- MSA depth=%d  L=%d  n_seqs=%d  temp=%.1f  seed=%d",
+                len(msa_seqs), len(msa_seqs[0]), n_seqs, temperature, seed)
+    m_seq = extract_msa_embedding_protenix(msa_seqs, msa_module, device)  # (L, 128)
+    return decode_from_embedding(decoder, m_seq, n_seqs=n_seqs, n_steps=n_steps,
+                                 temperature=temperature, device=device)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -199,7 +222,7 @@ def augment_shallow(
     shallow_seqs: list[str],
     decoder: SFMDecoder,
     latent_fm: LatentFMEncoder,
-    protenix_model,
+    msa_module,
     esm_model,
     alphabet,
     n_syn_seeds: int = 5,
@@ -224,7 +247,7 @@ def augment_shallow(
         shallow_seqs:     List of aligned sequences (shallow MSA, can be as few as 1).
         decoder:          Trained SFMDecoder.
         latent_fm:        Trained LatentFMEncoder.
-        protenix_model:   Loaded Protenix.
+        msa_module:       Loaded Protenix MSAModule.
         esm_model:        Loaded ESM2.
         alphabet:         ESM2 Alphabet.
         n_syn_seeds:      Number of synthetic embedding seeds (paper: 5).
@@ -270,7 +293,7 @@ def augment_shallow(
 
     # ── Reconstruction track (Rec): from shallow MSA embedding ───────────────
     logger.info("Rec track  ----- %d seqs from shallow MSA embedding", n_rec_seqs)
-    m_seq = extract_msa_embedding_protenix(shallow_seqs, protenix_model, device)   # (L, 128)
+    m_seq = extract_msa_embedding_protenix(shallow_seqs, msa_module, device)   # (L, 128)
     rec_seqs = decode_from_embedding(
         decoder, m_seq, n_seqs=n_rec_seqs, n_steps=n_steps,
         temperature=temperature, device=device
@@ -478,34 +501,41 @@ def main():
     parser.add_argument("--latent_fm_ckpt", default=None,  help="Path to latent FM checkpoint")
     parser.add_argument("--protenix_ckpt",  default=None,  help="Path to Protenix checkpoint")
     parser.add_argument("--output",         required=True, help="Output FASTA/A3M path")
-    parser.add_argument("--n_seqs",         type=int, default=32)
-    parser.add_argument("--n_steps",        type=int, default=100)
-    parser.add_argument("--temperature",    type=float, default=0.5)
+    parser.add_argument("--n_seqs",         type=int,   default=32)
+    parser.add_argument("--n_steps",        type=int,   default=100)
+    parser.add_argument("--temperature",    type=float, default=0.0)
+    parser.add_argument("--seed",           type=int,   default=42)
     parser.add_argument("--device",         default="cuda")
+    parser.add_argument("--alpha",          type=float, default=None,
+                        help="Override α-geometry (p=2/(1-α)). Default: read from checkpoint, else 0.0.")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    decoder = load_sfm_decoder(args.decoder_ckpt, device)
+    decoder = load_sfm_decoder(args.decoder_ckpt, device, alpha=args.alpha)
 
     generated = []
 
     if args.mode == "reconstruct":
         assert args.input_a3m and args.protenix_ckpt, "--input_a3m and --protenix_ckpt required"
-        protenix = load_protenix(args.protenix_ckpt, device)
+        msa_mod = load_msa_module(args.protenix_ckpt, device)
         _, seqs = parse_a3m(args.input_a3m)
         seqs = filter_msa(seqs)
-        generated = reconstruct(seqs, decoder, protenix, n_seqs=args.n_seqs, device=device)
+        generated = reconstruct(seqs, decoder, msa_mod, n_seqs=args.n_seqs, n_steps=args.n_steps,
+                                       temperature=args.temperature, seed=args.seed, device=device)
         write_a3m(seqs[0].replace("-", ""), generated, args.output)
+        input_path = args.output.replace(".a3m", "_input.a3m")
+        write_a3m(seqs[0].replace("-", ""), seqs[1:], input_path)
+        logger.info("Saved input seqs (%d seqs) → %s", len(seqs), input_path)
 
     elif args.mode == "augment":
         assert args.input_a3m and args.latent_fm_ckpt and args.protenix_ckpt
         latent_fm = load_latent_fm(args.latent_fm_ckpt, device)
-        protenix = load_protenix(args.protenix_ckpt, device)
+        msa_mod = load_msa_module(args.protenix_ckpt, device)
         esm_model, alphabet = load_esm2(device)
         _, seqs = parse_a3m(args.input_a3m)
         seqs = filter_msa(seqs)
-        generated = augment_shallow(seqs, decoder, latent_fm, protenix, esm_model, alphabet, device=device)
-        write_a3m(seqs[0].replace("-", ""), generated, args.output)
+        combined = augment_shallow(seqs, decoder, latent_fm, msa_mod, esm_model, alphabet, device=device)
+        write_a3m(seqs[0].replace("-", ""), combined, args.output)
 
     elif args.mode == "zeroshot":
         assert args.query_seq and args.latent_fm_ckpt

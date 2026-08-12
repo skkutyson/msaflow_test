@@ -7,24 +7,41 @@
 #SBATCH --mem=0
 #SBATCH --time=48:00:00
 #SBATCH --partition=normal
-#SBATCH --output=logs/latent_fm_%j.out
-#SBATCH --error=logs/latent_fm_%j.err
+#SBATCH --output=/home/yjlee4/MSA_FLOW/logs/latent_fm_%j.out
+#SBATCH --error=/home/yjlee4/MSA_FLOW/logs/latent_fm_%j.err
 
-# ── Python 모듈 로드 ───────────────────────────────────────────────────────────
-module load python/3.11.14
+# ── 경로 설정 ──────────────────────────────────────────────────────────────────
+REPO_DIR=/home/yjlee4/MSA_FLOW
+SANDBOX=/home/yjlee4/msaflow_sandbox
 
-# ── uv PATH 설정 ──────────────────────────────────────────────────────────────
-export PATH="$HOME/.local/bin:$PATH"
+LMDB_PATH=${LMDB_PATH:-/home/yjlee4/data/msaflow.lmdb}
+OUTPUT_DIR=${OUTPUT_DIR:-/home/yjlee4/data/runs/latent_fm}
 
-# ── 경로 설정 (환경에 맞게 수정) ──────────────────────────────────────────────
-REPO_DIR=${REPO_DIR:-/home/paul3875/projects/MSA_FLOW}
-LMDB_PATH=${LMDB_PATH:-/gpfs/deepfold/users/yjlee4/msaflow.lmdb}
-OUTPUT_DIR=${OUTPUT_DIR:-$REPO_DIR/runs/latent_fm}
-CONFIG=$REPO_DIR/msaflow/configs/latent_fm.yaml
-ACCEL_CONFIG=$REPO_DIR/msaflow/configs/accelerate_2gpu.yaml
+CONFIG=/mnt/MSA_FLOW/msaflow/configs/latent_fm.yaml
+ACCEL_CONFIG=/mnt/MSA_FLOW/msaflow/configs/accelerate_2gpu.yaml
 
-# ── 환경 활성화 ────────────────────────────────────────────────────────────────
-source $REPO_DIR/.venv/bin/activate
+# ── 로그 디렉터리 생성 ─────────────────────────────────────────────────────────
+mkdir -p "$REPO_DIR/logs" "$OUTPUT_DIR"
+
+echo "============================================================"
+echo " MSAFlow Latent FM Training (SLURM + Apptainer + uv)"
+echo "============================================================"
+echo " Job ID      : $SLURM_JOB_ID"
+echo " Node        : $SLURMD_NODENAME"
+echo " GPUs        : $CUDA_VISIBLE_DEVICES"
+echo " LMDB        : $LMDB_PATH"
+echo " OUTPUT_DIR  : $OUTPUT_DIR"
+echo " Started     : $(date)"
+echo "============================================================"
+
+# ── W&B 설정 ──────────────────────────────────────────────────────────────────
+WANDB_API_KEY_FILE=${WANDB_API_KEY_FILE:-$HOME/.wandb_api_key}
+if [[ -f "$WANDB_API_KEY_FILE" ]]; then
+    export WANDB_API_KEY=$(cat "$WANDB_API_KEY_FILE")
+else
+    echo "[WARN] W&B API key file not found: $WANDB_API_KEY_FILE  →  logging disabled"
+    export WANDB_MODE=disabled
+fi
 
 # ── NCCL 튜닝 ─────────────────────────────────────────────────────────────────
 export NCCL_DEBUG=WARN
@@ -33,23 +50,26 @@ export NCCL_P2P_DISABLE=1
 export NCCL_SHM_DISABLE=0
 export OMP_NUM_THREADS=8
 
-# ── 로그 디렉터리 생성 ─────────────────────────────────────────────────────────
-mkdir -p $OUTPUT_DIR $REPO_DIR/logs
+# ── Apptainer + uv run ────────────────────────────────────────────────────────
+apptainer exec --nv \
+    --env WANDB_API_KEY="$WANDB_API_KEY" \
+    --env WANDB_MODE="${WANDB_MODE:-online}" \
+    --bind "$REPO_DIR":/mnt/MSA_FLOW \
+    --bind "$(dirname "$LMDB_PATH")":/mnt/lmdb \
+    --bind "$OUTPUT_DIR":/mnt/output \
+    "$SANDBOX" \
+    bash -c "
+        set -euo pipefail
+        cd /mnt/MSA_FLOW
 
-echo "Job ID     : $SLURM_JOB_ID"
-echo "Node       : $SLURMD_NODENAME"
-echo "Python     : $(python --version)"
-echo "GPUs       : $CUDA_VISIBLE_DEVICES"
-echo "Output dir : $OUTPUT_DIR"
-echo "LMDB       : $LMDB_PATH"
-date
+        uv run accelerate launch \
+            --config_file $ACCEL_CONFIG \
+            msaflow/training/train_latent_fm.py \
+            --config      $CONFIG \
+            --lmdb_path   /mnt/lmdb/$(basename "$LMDB_PATH") \
+            --output_dir  /mnt/output
+    "
 
-# ── 학습 실행 ──────────────────────────────────────────────────────────────────
-accelerate launch \
-    --config_file $ACCEL_CONFIG \
-    $REPO_DIR/msaflow/training/train_latent_fm.py \
-    --config $CONFIG \
-    --lmdb_path $LMDB_PATH \
-    --output_dir $OUTPUT_DIR
-
-echo "Done: $(date)"
+echo "============================================================"
+echo " Done: $(date)"
+echo "============================================================"

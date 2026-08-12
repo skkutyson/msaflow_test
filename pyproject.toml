@@ -6,14 +6,24 @@ build-backend = "setuptools.build_meta"
 name = "msaflow"
 version = "0.1.0"
 description = "MSA generation via flow matching in latent space"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "torch>=2.2",
+    "torch>=2.7",
     "numpy>=1.24",
     "accelerate>=0.30",
     "omegaconf>=2.3",
     "lmdb>=1.4",
     "tqdm>=4.66",
+    "protenix",
+    "fair-esm",
+    # pytorch-cu128 whl does not declare nvidia-* as deps.
+    # Explicitly install CUDA 12.8 runtime packages so that
+    # torch.cuda.is_available() works inside Apptainer (Blackwell/sm_120).
+    "nvidia-cuda-runtime-cu12>=12.8,<13",
+    "nvidia-cublas-cu12>=12.8,<13",
+    "nvidia-cuda-nvrtc-cu12>=12.8,<13",
+    "nvidia-nvjitlink-cu12>=12.8,<13",
+    "nvidia-nccl-cu12>=2.21,<3",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +31,23 @@ dev = [
     "black>=24.0",
     "ruff>=0.4",
     "pre-commit>=3.7",
+]
+
+[tool.uv.sources]
+protenix = { path = "/mnt/MSA_FLOW/Protenix", editable = true }
+fair-esm = { path = "/mnt/MSA_FLOW/esm" }
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv]
+override-dependencies = [
+    "fair-esm @ file:///mnt/MSA_FLOW/esm",
+    # torch 2.7.1+cu128 (CUDA 12.8) supports Blackwell sm_120 and satisfies
+    # protenix==1.1.0's torch==2.7.1 pin without any version override.
 ]
 
 [tool.setuptools.packages.find]

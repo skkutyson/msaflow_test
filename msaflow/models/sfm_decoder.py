@@ -26,6 +26,19 @@ import torch.nn.functional as F
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (no mean centering, learnable scale)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return (x.float() / rms * self.weight).to(x.dtype)
+
+
 class SinusoidalTimeEmbedding(nn.Module):
     """Sinusoidal time embedding → MLP, output dim = hidden_size."""
 
@@ -45,7 +58,7 @@ class SinusoidalTimeEmbedding(nn.Module):
             -math.log(max_period) * torch.arange(half, dtype=torch.float32, device=t.device) / half
         )
         args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)   # (B, half)
-        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         if dim % 2:
             emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
         return emb
@@ -100,17 +113,26 @@ class PosWiseAdaLNBlock(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         x: (B, L, H)  — noisy sequence representation
         c: (B, L, H)  — per-position conditioning (t_emb broadcast + cond_proj)
+        key_padding_mask: (B, L) bool — True at padded positions to exclude from
+                          attention (matches nn.MultiheadAttention convention).
         """
         mod = self.adaLN_modulation(c)          # (B, L, 6*H)
         shift_sa, scale_sa, gate_sa, shift_ff, scale_ff, gate_ff = mod.chunk(6, dim=-1)
 
         # Self-attention with position-wise AdaLN pre-norm
         h = modulate_poswise(self.norm1(x), shift_sa, scale_sa)
-        attn_out, _ = self.attn(h, h, h)
+        attn_out, _ = self.attn(
+            h, h, h, key_padding_mask=key_padding_mask, need_weights=False
+        )
         x = x + gate_sa * attn_out
 
         # Feed-forward with position-wise AdaLN pre-norm
@@ -133,7 +155,7 @@ class FinalLayer(nn.Module):
         self.linear = nn.Linear(hidden_size, out_dim)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size),
+            nn.Linear(hidden_size, 3 * hidden_size),
         )
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
@@ -141,11 +163,12 @@ class FinalLayer(nn.Module):
         nn.init.zeros_(self.linear.bias)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        """x, c: (B, L, H) → (B, L, out_dim)."""
-        mod = self.adaLN_modulation(c)          # (B, L, 2*H)
-        shift, scale = mod.chunk(2, dim=-1)
-        x = modulate_poswise(self.norm(x), shift, scale)
-        return self.linear(x)
+        mod = self.adaLN_modulation(c)          # (B, L, 3H)
+        shift, scale, gate = mod.chunk(3, dim=-1)
+
+        x = modulate_poswise(self.norm(x), shift, scale)  # (B, L, H)
+        x = gate * x                                       # gate in hidden space
+        return self.linear(x)                              # (B, L, out_dim)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -179,10 +202,15 @@ class SFMDecoder(nn.Module):
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
         max_seq_len: int = 2048,
+        alpha: float = 0.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
+        # α-Flow geometry: α=0 → unit L² sphere (SFM); α=0.5 → unit L⁴ sphere.
+        # p = 2/(1-α) sets the Lᵖ-tangent projection applied to the output velocity.
+        self.alpha = alpha
+        self.p = 2.0 / (1.0 - alpha)
 
         # ── Input projection ──────────────────────────────────────────────────
         self.input_proj = nn.Linear(vocab_size, hidden_size)
@@ -198,15 +226,24 @@ class SFMDecoder(nn.Module):
         self.time_emb = SinusoidalTimeEmbedding(hidden_size)
 
         # ── Conditioning projection (per-residue MSA emb → hidden) ────────────
-        # LayerNorm normalises AF3 MSA embeddings (std >> 1) before projection.
+        # RMSNorm normalises AF3 MSA embeddings (std >> 1) before projection.
         # Without it ∂L/∂W_cond inherits m_seq scale → cond_proj dominates
         # total grad_norm and forces an effectively near-zero LR after clipping.
-        self.msa_norm = nn.LayerNorm(msa_dim)
+        # RMSNorm preferred over LayerNorm: no mean-centering, stable on sparse inputs.
+        self.msa_norm = RMSNorm(msa_dim)
         self.cond_proj = nn.Linear(msa_dim, hidden_size)
 
         # ── Transformer blocks ────────────────────────────────────────────────
         self.blocks = nn.ModuleList([
             PosWiseAdaLNBlock(hidden_size, num_heads, mlp_ratio)
+            for _ in range(depth)
+        ])
+
+        # Per-block conditioning offsets: each block gets a residual on the
+        # shared cond vector, allowing the network to route different conditioning
+        # signals to different layers. Zero-inited → identity at init.
+        self.block_cond_projs = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size, bias=False)
             for _ in range(depth)
         ])
 
@@ -227,6 +264,9 @@ class SFMDecoder(nn.Module):
         # Time MLP
         nn.init.normal_(self.time_emb.mlp[0].weight, std=0.02)
         nn.init.normal_(self.time_emb.mlp[2].weight, std=0.02)
+        # block_cond_projs: zero-init so blocks start as identity conditioning
+        for proj in self.block_cond_projs:
+            nn.init.zeros_(proj.weight)
 
     @staticmethod
     def _build_sincos_pos_emb(max_len: int, dim: int) -> torch.Tensor:
@@ -245,17 +285,23 @@ class SFMDecoder(nn.Module):
         x_t: torch.Tensor,
         m_seq: torch.Tensor,
         t: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             x_t:   (B, L, vocab_size) — noisy sequence on the unit sphere.
             m_seq: (B, L, msa_dim)    — compressed MSA embedding per residue.
             t:     (B,)               — timesteps in [0, 1].
+            padding_mask: (B, L) bool — True at real residues, False at padding.
+                          When None (single-MSA batches), no positions are masked.
 
         Returns:
             v: (B, L, vocab_size) — predicted velocity in tangent space.
         """
         B, L, _ = x_t.shape
+
+        # nn.MultiheadAttention expects True = "ignore this key", so invert.
+        key_padding_mask = (~padding_mask) if padding_mask is not None else None
 
         # Project input sequence to hidden space + positional encoding
         h = self.input_proj(x_t) + self.pos_emb[:, :L, :]       # (B, L, H)
@@ -265,105 +311,151 @@ class SFMDecoder(nn.Module):
         cond = t_emb + self.cond_proj(self.msa_norm(m_seq))      # (B, L, H)
 
         # Transformer blocks with position-wise AdaLN
-        for block in self.blocks:
-            h = block(h, cond)
+        for block, cond_proj in zip(self.blocks, self.block_cond_projs):
+            h = block(h, cond + cond_proj(cond), key_padding_mask=key_padding_mask)
 
         # Final projection back to vocab space
-        return self.final_layer(h, cond)                         # (B, L, vocab_size)
+        v = self.final_layer(h, cond)                            # (B, L, vocab_size)
+
+        # Project onto the tangent space of the Lᵖ sphere at x_t (α-Flow Eq. 11):
+        #   P_x(v) = v - x · Σⱼ xⱼ^(p-1) vⱼ
+        # At α=0 (p=2) this is the standard v - <v, x_t>·x_t.
+        v32 = v.float()
+        x_t_f32 = x_t.float()
+        coeff = (x_t_f32.clamp(min=0.0).pow(self.p - 1.0) * v32).sum(dim=-1, keepdim=True)
+        v_tangent = v32 - x_t_f32 * coeff
+        return v_tangent.to(v.dtype)                             # (B, L, vocab_size)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SFM training loss
+# Flow-matching training loss (unified α-Flow; SFM = the α=0 case)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def sfm_loss(
+def flow_loss(
     model: SFMDecoder,
     tokens: torch.Tensor,
     m_seq: torch.Tensor,
+    vocab_size: Optional[int] = None,
+    alpha: float = 0.0,
     weights: Optional[torch.Tensor] = None,
     padding_mask: Optional[torch.Tensor] = None,
     eps: float = 1e-8,
     t_max_eps: float = 0.01,
 ) -> torch.Tensor:
     """
-    Compute SFM training loss for one batch (Eq. 3 in the paper).
+    Unified α-Flow training loss on the unit Lᵖ sphere, p = 2/(1-α)
+    (Cheng et al., "α-Flow", arXiv:2504.10283, Algorithm 1).
 
-    L_SFM(θ) = E_{t~U[0,1], s_i, µ_0}[‖v_θ(x_t|m,t) − u_t(x_t|x_0,x_1)‖²]
+        L(α) = E_{t~U[0,1-t_max_eps], x0, x1}[ ‖v_θ(x_t|m,t) − u_t(x_t|x0,x1)‖²_α ]
 
-    Numerical stability fixes (original code had grad_norm=1305 due to bf16 ops):
+    ONE code path for every geometry: α=0 (p=2, unit L² sphere) is the special
+    case that recovers SFM; α=0.5 (p=4) is the L⁴ sphere; etc.  All geometry
+    lives in `msaflow.utils.alpha_geometry`.
 
-      Fix 1 — float32 geometry: x0, x1, x_t and u_t computed in float32
-        independent of model autocast dtype.  At t=0.99 in bfloat16, the
-        log_map direction (y − dot·x) has SNR≈0.02; in float32 SNR≈750.
+    Note vs. the original SFM: this uses the α-Flow "simplified maps" (Eq. 9,10) —
+    the Lᵖ-normalised straight-line α-geodesic parameterised by τ(t)=t.  At α=0
+    this traces the same great circle as the original acos/sin SFM but with a
+    non-arc-length time parameterisation: a valid, equivalent-family conditional
+    path, not bit-identical to the old great-circle formulation.
 
-      Fix 2 — float32 MSE: v_pred upcast before the squared error.
-
-      Fix 3 — time truncation: t ∈ [0, 1-t_max_eps] avoids the t=1 endpoint
-        where log_map involves near-identical points.  With t_max_eps=0.01
-        the remaining angle is 1% of the geodesic, giving SNR>100 in float32.
-
-    NOTE: (1-t)² time-weighting was previously applied but has been removed.
-    The paper loss (Eq. 3) uses uniform weighting over t.  The (1-t)² variant
-    created a severe train–inference mismatch: gradient signal at t>0.7 was
-    <9% of the t=0 signal, so the model never learned the high-t regime.
-    Inference integrates t=0→1 uniformly, causing garbage output in that range.
+    Stability: x0, x1, x_t, u_t and the squared error are all in float32
+    regardless of autocast dtype; t is truncated to [0, 1-t_max_eps]; v_pred is
+    upcast and re-projected to the tangent at x_t before the α-weighted norm.
 
     Args:
-        model:      SFMDecoder.
+        model:      SFMDecoder, or the DDP/Accelerate-wrapped module around it.
+                    Pass the *wrapped* model so DDP.forward() arms gradient
+                    all-reduce and the Accelerate bf16 autocast applies; then pass
+                    `vocab_size` explicitly (the wrapper hides `.vocab_size`).
         tokens:     (B, L) integer token ids in [0, vocab_size).
         m_seq:      (B, L, msa_dim) compressed MSA embedding.
-        weights:    (B,) optional per-sample loss weights (Neff reweighting).
-        padding_mask: (B, L) bool tensor — True at real positions, False at padding.
-                      Excludes padded positions from the loss (relevant when batch_size>1
-                      and MSAs of different lengths are packed into the same batch).
-        eps:        numerical stability constant for sphere ops.
-        t_max_eps:  upper time truncation margin (default 0.01 → t ∈ [0, 0.99]).
+        vocab_size: V. Falls back to `model.vocab_size` when None (unwrapped model).
+        alpha:      α-geometry parameter in [-1, 1). 0 → L² sphere (SFM).
+        weights:    (B,) optional per-sample Neff weights.
+        padding_mask: (B, L) bool, True at real residues (masked from BOTH the loss
+                      and self-attention).
+        eps, t_max_eps: numerical margins.
 
     Returns:
         loss: scalar.
     """
-    from msaflow.utils.spherical import (
-        onehot_to_sphere,
-        sample_sphere_noise,
-        geodesic_interpolate,
-        target_velocity,
+    from msaflow.utils.alpha_geometry import (
+        p_from_alpha, onehot_to_alpha, sample_alpha_noise,
+        alpha_interpolate, alpha_target_velocity, tangent_project, alpha_metric_sq,
     )
 
     B, L = tokens.shape
     device = tokens.device
+    V = vocab_size if vocab_size is not None else model.vocab_size
+    p = p_from_alpha(alpha)
 
-    # Fix 1: x1, x0, x_t and u_t all in float32 for stable sphere geometry
-    x1 = onehot_to_sphere(tokens, model.vocab_size, eps=eps)   # (B, L, V) float32
-    x0 = sample_sphere_noise((B, L, model.vocab_size), device=device, dtype=torch.float32)
+    # All geometry in float32 for stability (independent of autocast dtype).
+    x1 = onehot_to_alpha(tokens, V, p, eps=eps)                        # (B, L, V) f32
+    x0 = sample_alpha_noise((B, L, V), p, device=device, dtype=torch.float32)
 
-    # Fix 3: truncate t away from the t=1 singularity
-    t = torch.rand(B, device=device) * (1.0 - t_max_eps)      # (B,)  ∈ [0, 1-t_max_eps]
-    t_bcast = t.view(B, 1, 1)                                  # (B, 1, 1)
+    t = torch.rand(B, device=device) * (1.0 - t_max_eps)              # (B,) ∈ [0, 1-t_max_eps]
+    t_bcast = t.view(B, 1, 1)
 
-    x_t = geodesic_interpolate(x0, x1, t_bcast, eps=eps)      # (B, L, V) float32
-    u_t = target_velocity(x_t, x1, t_bcast, eps=eps)          # (B, L, V) float32
+    x_t = alpha_interpolate(x0, x1, t_bcast, p, eps=eps)              # (B, L, V)
+    u_t = alpha_target_velocity(x0, x1, x_t, t_bcast, p, eps=eps)     # (B, L, V)
 
-    # Predicted velocity (may be bfloat16 under Accelerate autocast)
-    v_pred = model(x_t, m_seq, t)                              # (B, L, V)
+    # padding_mask also flows into attention so padded keys don't contaminate
+    # real positions (relevant when batch_size>1 packs variable-length MSAs).
+    v_pred = model(x_t, m_seq, t, padding_mask=padding_mask)         # (B, L, V)
+    v_pred = tangent_project(v_pred.float(), x_t, p)                  # fp32, tangent at x_t
 
-    # Fix 2: upcast to float32 before MSE
-    loss = ((v_pred.float() - u_t) ** 2).sum(dim=-1)           # (B, L)
+    loss = alpha_metric_sq(v_pred - u_t, x_t, alpha, p)              # (B, L)  α-weighted
+    return _reduce_perpos_loss(loss, weights, padding_mask, B, L)
 
+
+def sfm_loss(
+    model: SFMDecoder,
+    tokens: torch.Tensor,
+    m_seq: torch.Tensor,
+    vocab_size: Optional[int] = None,
+    weights: Optional[torch.Tensor] = None,
+    padding_mask: Optional[torch.Tensor] = None,
+    eps: float = 1e-8,
+    t_max_eps: float = 0.01,
+) -> torch.Tensor:
+    """Backward-compat alias: the α=0 case of `flow_loss` (unit L² sphere)."""
+    return flow_loss(model, tokens, m_seq, vocab_size=vocab_size, alpha=0.0,
+                     weights=weights, padding_mask=padding_mask, eps=eps, t_max_eps=t_max_eps)
+
+
+def _reduce_perpos_loss(loss, weights, padding_mask, B, L):
+    """Mask padded positions, apply per-sample weights, and normalise by the
+    effective count so the loss scale is invariant to length / batch / weighting.
+    loss: (B, L)."""
     if padding_mask is not None:
-        # padding_mask: (B, L) bool — zero out padded positions so they don't
-        # contribute to the gradient (avoids training the model to predict
-        # token 0 / Alanine at padding positions).
-        loss = loss * padding_mask.float()                     # (B, L)
-
+        loss = loss * padding_mask.float()
     if weights is not None:
-        # weights: (B,) — down-weight redundant sequences via Neff reweighting
-        loss = loss * weights.unsqueeze(1)                     # (B, L)
+        loss = loss * weights.unsqueeze(1)
 
-    # Normalise by the number of real (non-padded) positions so the loss scale
-    # stays invariant to sequence length and batch composition.
-    # When padding_mask is None every position is real, so this equals loss.mean().
     if padding_mask is not None:
-        n_real = padding_mask.float().sum().clamp(min=1.0)
+        if weights is not None:
+            n_real = (weights.unsqueeze(1) * padding_mask.float()).sum().clamp(min=1.0)
+        else:
+            n_real = padding_mask.float().sum().clamp(min=1.0)
     else:
-        n_real = loss.numel()
+        if weights is not None:
+            n_real = weights.sum().clamp(min=1.0) * L
+        else:
+            n_real = float(B * L)
     return loss.sum() / n_real
+
+
+def alpha_flow_loss(
+    model: SFMDecoder,
+    tokens: torch.Tensor,
+    m_seq: torch.Tensor,
+    vocab_size: Optional[int] = None,
+    alpha: float = 0.5,
+    weights: Optional[torch.Tensor] = None,
+    padding_mask: Optional[torch.Tensor] = None,
+    eps: float = 1e-8,
+    t_max_eps: float = 0.01,
+) -> torch.Tensor:
+    """Backward-compat alias for `flow_loss` with an explicit α (default 0.5)."""
+    return flow_loss(model, tokens, m_seq, vocab_size=vocab_size, alpha=alpha,
+                     weights=weights, padding_mask=padding_mask, eps=eps, t_max_eps=t_max_eps)

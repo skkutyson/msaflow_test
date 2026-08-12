@@ -12,17 +12,16 @@ Two datasets are provided:
     One-to-one: query embedding → MSA embedding.
 """
 
-import json
+import logging
 import pickle
 import random
-from pathlib import Path
-from typing import Optional
 
+import lmdb
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from msaflow.data.preprocessing import VOCAB_SIZE
+logger = logging.getLogger(__name__)
 
 
 class MSADecoderDataset(Dataset):
@@ -50,8 +49,7 @@ class MSADecoderDataset(Dataset):
         max_seq_len: int = 1024,
         require_msa_emb: bool = True,
     ):
-        import lmdb as lmdb_lib
-        self.env = lmdb_lib.open(
+        self.env = lmdb.open(
             lmdb_path,
             readonly=True,
             lock=False,
@@ -67,10 +65,9 @@ class MSADecoderDataset(Dataset):
             all_keys = [k.decode() for k in txn.cursor().iternext(keys=True, values=False)]
 
         if require_msa_emb:
-            # Sample a small subset to check if msa_emb exists.
-            # Full scan of 250k+ entries takes ~15 min — avoid it by spot-checking.
-            import random as _random
-            sample = _random.sample(all_keys, min(100, len(all_keys)))
+            # Spot-check a random subset for msa_emb rather than scanning all
+            # 250k+ entries (a full scan takes ~15 min).
+            sample = random.sample(all_keys, min(100, len(all_keys)))
             missing = 0
             with self.env.begin() as txn:
                 for k in sample:
@@ -78,8 +75,7 @@ class MSADecoderDataset(Dataset):
                     if entry.get("msa_emb") is None:
                         missing += 1
             if missing > 0:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
+                logger.warning(
                     "%d/%d sampled entries missing msa_emb — "
                     "set require_msa_emb=False or re-run preprocessing with Protenix",
                     missing, len(sample),
@@ -131,8 +127,7 @@ class LatentFMDataset(Dataset):
     """
 
     def __init__(self, lmdb_path: str, max_seq_len: int = 1024):
-        import lmdb as lmdb_lib
-        self.env = lmdb_lib.open(
+        self.env = lmdb.open(
             lmdb_path,
             readonly=True,
             lock=False,
@@ -145,7 +140,7 @@ class LatentFMDataset(Dataset):
         with self.env.begin() as txn:
             all_keys = [k.decode() for k in txn.cursor().iternext(keys=True, values=False)]
 
-        # Require both embeddings
+        # Keep only entries that have both embeddings.
         valid = []
         with self.env.begin() as txn:
             for k in all_keys:

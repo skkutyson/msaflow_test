@@ -15,7 +15,6 @@ Usage:
         --output_dir /runs/latent_fm
 """
 
-import math
 import logging
 import argparse
 from pathlib import Path
@@ -23,7 +22,6 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -156,8 +154,10 @@ def train(cfg):
                 z1      = batch["msa_emb"]   # (B, L, 128)
                 esm_emb = batch["esm_emb"]   # (B, L, 1280)
 
+                # Pass the *wrapped* model so DDP.forward() arms gradient
+                # all-reduce across GPUs and the Accelerate bf16 autocast applies.
                 loss = rectified_flow_loss(
-                    accelerator.unwrap_model(model),
+                    model,
                     z1,
                     esm_emb,
                 )
@@ -168,10 +168,13 @@ def train(cfg):
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
 
                 optimizer.step()
-                scheduler.step()
                 optimizer.zero_grad()
 
+                # Step the LR schedule once per optimizer update, not per
+                # micro-batch — otherwise with grad_accumulation>1 the schedule
+                # advances grad_accumulation× too fast.
                 if accelerator.sync_gradients:
+                    scheduler.step()
                     global_step += 1
                     if ema is not None:
                         ema.update(accelerator.unwrap_model(model))

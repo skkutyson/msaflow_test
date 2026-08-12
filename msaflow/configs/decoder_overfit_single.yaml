@@ -1,0 +1,62 @@
+# MSAFlow SFM Decoder — SINGLE-TARGET overfit / sanity-check config
+#
+# Goal: verify the *faithful Protenix embedding* pipeline end-to-end by
+# overfitting ONE MSA.  If the decoder cannot drive training loss toward ~0
+# on a single sample, there is a fundamental bug (wrong loss direction, bad
+# conditioning scale, broken msa_emb, etc.) — cheaper to catch here than on
+# the full run.
+#
+# Usage (see scripts/train_decoder_overfit_single.sh):
+#   accelerate launch msaflow/training/train_decoder.py \
+#       --config msaflow/configs/decoder_overfit_single.yaml \
+#       --lmdb_path /gpfs/deepfold/users/yjlee4/msaflow_overfit_7pv5-assembly1.lmdb \
+#       --output_dir /runs/decoder_overfit_single
+
+model:
+  vocab_size: 22
+  msa_dim: 128
+  hidden_size: 768        # same architecture as production run
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+  max_seq_len: 1024
+  # alpha: 0.0            # α-geometry (0.0 = L² sphere / SFM). set 0.5 for α-Flow.
+
+data:
+  lmdb_path: /gpfs/deepfold/users/yjlee4/msaflow_overfit_7pv5-assembly1.lmdb
+  n_seqs_per_msa: 32
+  max_seq_len: 1024
+  batch_size: 1
+  num_workers: 0          # 0 for reproducibility / easier debugging
+  n_debug_samples: 1      # ← KEY: single MSA, same every epoch
+
+training:
+  epochs: 500             # many epochs — must overfit a single sample
+  lr: 1.0e-4              # 10× higher LR to reach overfit faster
+  weight_decay: 0.0       # no regularisation — we WANT overfit
+  warmup_steps: 50
+  max_grad_norm: 10.0
+  grad_accumulation: 1    # no accumulation — see every gradient
+  seed: 42
+  output_dir: /runs/decoder_overfit_single
+  resume: true
+  log_every: 10           # frequent logging to watch loss curve
+  ema_decay: 0.9999
+  use_ema: false          # skip EMA overhead during debug
+  save_checkpoint_every: 100
+  mixed_precision: "bf16"
+  use_wandb: true
+  wandb_project: msaflow
+  wandb_run_name: decoder_overfit_single_7pv5_ncycle1
+  val_every: 100          # sample from the single training MSA
+  val_ode_steps: 100
+  t_max_eps: 0.01
+
+# Expected behaviour (single sample overfits faster than the 16-sample config):
+#   epoch ~30  : loss < 0.5
+#   epoch ~150 : loss < 0.05
+#   epoch ~400 : loss < 0.01  (near-perfect overfit)
+#   val/seq_recovery → ~1.0 at convergence
+#
+# If loss plateaus above 0.3 → investigate gradient flow / loss computation /
+# msa_emb conditioning (RMSNorm scale, faithful embedding sanity).

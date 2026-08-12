@@ -3,10 +3,13 @@ MSAFlow data preprocessing pipeline.
 
 Two preprocessing stages:
 
-1. extract_msa_embeddings()
-   Runs the Protenix MSAModule over OpenFold MSA files and dumps the
-   compressed pair representation (L×128) to an LMDB database.
-   This corresponds to the AF3-encoder step described in Section 3.1 and 6.8.1.
+1. extract_msa_embedding_protenix()
+   Runs the FULL Protenix trunk (real featurization + recycling via
+   get_pairformer_output), captures the MSAModule pair output z with a forward
+   hook, and mean-pools the last cycle to the compressed representation (L×128).
+   This is the faithful AF3-encoder step described in Section 3.1 and 6.8.1,
+   verified end-to-end by scripts/probe_protenix_msa_encoder.py.
+   Requires CCD files in $PROTENIX_ROOT_DIR/common (default: $HOME/common).
 
 2. extract_esm_embeddings()
    Computes ESM2-650M representations (L×1280) for query sequences and stores
@@ -25,7 +28,6 @@ LMDB schema per entry (pickled dict):
   }
 """
 
-import os
 import sys
 import pickle
 import logging
@@ -128,26 +130,6 @@ class PreprocessStats:
         logger.info("=" * 60)
 
 
-def _log_entry_shapes(key: str, entry: dict, verbose: bool) -> None:
-    """Log shapes of a single LMDB entry when verbose=True."""
-    if not verbose:
-        return
-    shapes = {
-        k: (v.shape if isinstance(v, np.ndarray) else
-            (v.shape if isinstance(v, torch.Tensor) else type(v).__name__))
-        for k, v in entry.items()
-    }
-    logger.debug(
-        "  [%s]  seq_len=%d  msa_depth=%d  "
-        "esm_emb=%s  msa_emb=%s",
-        key,
-        entry["seq_len"],
-        entry["msa_tokens"].shape[0],
-        shapes.get("esm_emb", "None"),
-        shapes.get("msa_emb", "None"),
-    )
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # MSA I/O helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -205,101 +187,196 @@ def compute_sequence_weights(tokens: np.ndarray, threshold: float = 0.2) -> np.n
     N, _ = tokens.shape
     if N == 1:
         return np.ones(1, dtype=np.float32)
-    # (N, N) pairwise fractional Hamming distances
-    # tokens: (N, L) int → broadcast diff → mean over L axis
-    diff = (tokens[:, None, :] != tokens[None, :, :])   # (N, N, L) bool
-    hamming = diff.mean(axis=-1)                         # (N, N) float
-    similar = hamming < threshold                        # (N, N) bool
-    counts = similar.sum(axis=1).astype(np.float32)      # includes self (hamming=0)
-    return 1.0 / counts.clip(min=1.0)
+    # Vectorised pairwise Hamming: (N, N) fraction of differing positions
+    diff = (tokens[:, None, :] != tokens[None, :, :]).mean(axis=-1)  # (N, N)
+    n_sim = (diff < threshold).sum(axis=1).astype(np.float32)        # includes self
+    return 1.0 / n_sim
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MSA embedding extraction via Protenix
+# MSA embedding extraction via Protenix (faithful path)
+#
+# Verified end-to-end by scripts/probe_protenix_msa_encoder.py: real Protenix
+# featurization + full model trunk with recycling, halted after the MSAModule.
+# Replaces the old shortcut that fed z=0 / s_inputs=0 into a bare MSAModule
+# (MSA-only, out-of-distribution).
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _build_protenix_msa_input(seqs: list[str], device: torch.device) -> dict:
+def _seqs_to_a3m(seqs: list[str]) -> str:
+    """Serialise processed aligned sequences back to an A3M string.
+
+    Insertion columns were already stripped by parse_a3m(), so this A3M holds
+    match columns only — consistent with the msa_tokens stored in the entry.
+    The first record must be the (gap-free) query.
     """
-    Build minimal input_feature_dict for the Protenix MSAModule.
+    return "\n".join(f">seq{i}\n{s}" for i, s in enumerate(seqs))
 
-    The MSAModule (Algorithm 8 in AF3) expects:
-      - msa:             (1, N_msa, L) int64  — amino acid indices (0..31 = AF3 vocab)
-      - has_deletion:    (1, N_msa, L) float
-      - deletion_value:  (1, N_msa, L) float
 
-    We map our 22-token alphabet to AF3's 32-token residue encoding.
+def _build_protenix_feature_dict(
+    query_seq: str,
+    a3m_string: str,
+    device: torch.device,
+) -> dict:
+    """Build the real Protenix input_feature_dict for one monomer.
+
+    Mirrors protenix.data.inference.infer_dataloader.InferenceDataset.process_one:
+    structure/token/atom features via SampleDictToFeatures, MSA features via
+    InferenceMSAFeaturizer, dummy template features.
+    Requires CCD files in $PROTENIX_ROOT_DIR/common (default: $HOME/common).
     """
-    import sys
-    sys.path.insert(0, str(Path(__file__).parents[3] / "Protenix"))
-    from protenix.data.constants import STD_RESIDUES_WITH_GAP
+    from protenix.data.inference.json_to_feature import SampleDictToFeatures
+    from protenix.data.msa.msa_featurizer import InferenceMSAFeaturizer
+    from protenix.data.utils import data_type_transform, make_dummy_feature
+    from protenix.utils.torch_utils import dict_to_tensor
 
-    # Build AF3 residue → index mapping
-    af3_res_to_idx = {r: i for i, r in enumerate(STD_RESIDUES_WITH_GAP)}
-    # Map our tokens to AF3 indices (unknown → last index 31)
-    unk_idx = len(STD_RESIDUES_WITH_GAP) - 1
-
-    N = len(seqs)
-    L = len(seqs[0])
-    msa_arr = np.zeros((N, L), dtype=np.int64)
-    for i, seq in enumerate(seqs):
-        for j, aa in enumerate(seq):
-            msa_arr[i, j] = af3_res_to_idx.get(aa.upper(), unk_idx)
-
-    msa_t = torch.from_numpy(msa_arr).unsqueeze(0).to(device)   # (1, N, L)
-    zeros = torch.zeros(1, N, L, device=device)
-
-    return {
-        "msa": msa_t,
-        "has_deletion": zeros,
-        "deletion_value": zeros,
+    # Protenix takes the MSA inline via `unpairedMsa` (a3m string) — no temp file.
+    sample_dict = {
+        "name": "msaflow",
+        "sequences": [
+            {
+                "proteinChain": {
+                    "sequence": query_seq,
+                    "count": 1,
+                    "unpairedMsa": a3m_string,
+                    "pairedMsa": "",           # monomer: no pairing
+                }
+            }
+        ],
     }
 
+    # 1) structure/token features (restype, residue_index, token_bonds, atom feats...)
+    s2f = SampleDictToFeatures(sample_dict)
+    feat, atom_array, _token_array = s2f.get_feature_dict()
+    feat["distogram_rep_atom_mask"] = torch.Tensor(
+        atom_array.distogram_rep_atom_mask
+    ).long()
 
+    # 2) MSA features (msa, has_deletion, deletion_value, profile, deletion_mean)
+    msa_feat = InferenceMSAFeaturizer.make_msa_feature(
+        bioassembly=sample_dict["sequences"],
+        atom_array=atom_array,
+        msa_pair_as_unpair=True,   # monomer: treat as unpaired
+        use_rna_msa=False,
+    )
+    dummy_feats = ["template"]     # no templates -> dummy template feats
+    if len(msa_feat) == 0:
+        dummy_feats.append("msa")
+    else:
+        feat.update(dict_to_tensor(msa_feat))
+    feat = make_dummy_feature(features_dict=feat, dummy_feats=dummy_feats)
+    feat = data_type_transform(feat_or_label_dict=feat)
+
+    # the model accepts unbatched [..., N_token] features
+    return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in feat.items()}
+
+
+def load_protenix_model(
+    checkpoint: str,
+    device: torch.device,
+    model_name: str = "protenix_base_default_v1.0.0",
+):
+    """Build the FULL Protenix model and load the whole checkpoint.
+
+    Mirrors runner/inference.py::run(): base + data + inference configs,
+    deep-updated with the model-specific overrides, then parsed into an
+    attribute-style ConfigDict (configs_base alone is a plain dict and fails).
+    """
+    from copy import deepcopy
+    from typing import Mapping
+
+    from configs.configs_base import configs as configs_base
+    from configs.configs_data import data_configs
+    from configs.configs_inference import inference_configs
+    from configs.configs_model_type import model_configs
+    from protenix.config.config import parse_configs
+    from protenix.model.protenix import Protenix
+
+    merged = deepcopy({**configs_base, "data": data_configs, **inference_configs})
+
+    def deep_update(d, u):
+        for k, v in u.items():
+            if isinstance(v, Mapping) and k in d and isinstance(d[k], Mapping):
+                deep_update(d[k], v)
+            else:
+                d[k] = v
+        return d
+
+    deep_update(merged, model_configs[model_name])
+    configs = parse_configs(configs=merged, fill_required_with_null=True)
+
+    model = Protenix(configs).to(device).eval()
+    state = torch.load(checkpoint, map_location=device, weights_only=False)
+    sd = state.get("model", state)
+    # strip a possible "module." DDP prefix
+    sd = {(k[len("module."):] if k.startswith("module.") else k): v
+          for k, v in sd.items()}
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    logger.info("Loaded full Protenix (%s)  missing=%d unexpected=%d",
+                model_name, len(missing), len(unexpected))
+    return model
+
+
+@torch.no_grad()
 def extract_msa_embedding_protenix(
     seqs: list[str],
     protenix_model,
     device: torch.device,
+    n_cycle: int = 3,
 ) -> torch.Tensor:
     """
-    Extract compressed MSA embedding using Protenix's MSAModule.
+    Extract the compressed MSA embedding via the full Protenix trunk
+    (mirrors Section 3.1 & 6.8.1 of the paper):
 
-    Steps (mirrors Section 3.1 & 6.8.1 of the paper):
-      1. Build AF3-format input features from MSA sequences.
-      2. Run the MSAModule to obtain pair representation P ∈ R^(L×L×128).
-      3. Mean-pool along the second spatial dimension → m_seq ∈ R^(L×128).
+      1. Real Protenix featurization of query + MSA.
+      2. Run get_pairformer_output with N_cycle recycling iterations; a forward
+         hook captures the MSAModule pair output z ∈ R^(L×L×128) each cycle.
+      3. Mean-pool the LAST cycle along the second spatial dim → m_seq (L, 128).
+
+    Geometry runs in fp32 (no autocast), matching the verified probe numerics.
 
     Args:
-        seqs:            List of aligned sequences (all same length L).
-        protenix_model:  Loaded Protenix model (nn.Module) with .msa_module attribute.
-        device:          Compute device.
+        seqs:           Aligned sequences (match columns only, same length L).
+                        seqs[0] must be the gap-free query.
+        protenix_model: Full Protenix model from load_protenix_model().
+        device:         Compute device.
+        n_cycle:        Recycling cycles (paper uses few; 3 = MSAFlow default).
 
     Returns:
-        m_seq: (L, 128) compressed MSA embedding.
+        m_seq: (L, 128) compressed MSA embedding (last cycle).
     """
-    L = len(seqs[0])
-    logger.info("Extracting MSA embedding  ----- %d seqs, L=%d", len(seqs), L)
+    from protenix.model.protenix import update_input_feature_dict
 
-    # Build dummy pair embedding z and single embedding s_inputs
-    # (MSAModule updates z; we start from zeros for embedding extraction)
-    c_z = 128
-    c_s = 449
-    z = torch.zeros(1, L, L, c_z, device=device)
-    s_inputs = torch.zeros(1, L, c_s, device=device)
-    pair_mask = torch.ones(1, L, L, device=device, dtype=torch.bool)
+    query_seq = seqs[0].replace("-", "")
+    logger.info("Extracting MSA embedding  ----- %d seqs, L=%d, n_cycle=%d",
+                len(seqs), len(query_seq), n_cycle)
 
-    feat = _build_protenix_msa_input(seqs, device)
+    feat = _build_protenix_feature_dict(query_seq, _seqs_to_a3m(seqs), device)
 
-    with torch.no_grad():
-        z_updated = protenix_model.msa_module(
-            input_feature_dict=feat,
-            z=z,
-            s_inputs=s_inputs,
-            pair_mask=pair_mask,
-        )  # (1, L, L, 128)
+    # Protenix.forward() preprocesses the feature dict before the trunk — mirror it:
+    # relp for RelativePositionEncoding; d_lm/v_lm/pad_info for AtomAttentionEncoder.
+    feat = protenix_model.relative_position_encoding.generate_relp(feat)
+    feat = update_input_feature_dict(feat)
 
-    # Mean-pool along second spatial dimension (Eq. 4 in paper)
-    m_seq = z_updated[0].mean(dim=1)   # (L, 128)
-    return m_seq.cpu()
+    captured = []                          # one entry per recycling cycle
+
+    def hook(_module, _inp, out):
+        z = out.detach()                   # out: [..., L, L, c_z]
+        if z.dim() == 4:                   # [B, L, L, c_z]
+            z = z[0]
+        captured.append(z.mean(dim=1).float().cpu())   # (L, 128) — paper Eq. 4
+
+    h = protenix_model.msa_module.register_forward_hook(hook)
+    try:
+        # get_pairformer_output(input_feature_dict, N_cycle) -> (s_inputs, s, z)
+        protenix_model.get_pairformer_output(feat, N_cycle=n_cycle)
+    finally:
+        h.remove()
+
+    if len(captured) != n_cycle:
+        raise RuntimeError(
+            f"msa_module hook fired {len(captured)}x, expected {n_cycle}"
+        )
+    return captured[-1]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -331,7 +408,7 @@ def extract_esm_embedding(
     _, _, tokens = converter([("query", query_seq)])
     tokens = tokens.to(device)
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device.type, dtype=torch.float16):
         out = esm_model(tokens, repr_layers=[layer], return_contacts=False)
 
     emb = out["representations"][layer][0, 1:-1, :]  # remove BOS/EOS → (L, 1280)
@@ -350,8 +427,8 @@ def build_lmdb(
     max_seq_len: int = 1024,
     device: str = "cuda",
     map_size_gb: int = 500,
-    log_every: int = 100,
-    verbose: bool = False,
+    protein_list: Optional[str] = None,
+    n_cycle: int = 3,
 ):
     """
     Process all A3M files in a3m_dir and write LMDB database.
@@ -364,36 +441,28 @@ def build_lmdb(
         max_seq_len:          Maximum sequence length.
         device:               Compute device string.
         map_size_gb:          LMDB map size in GB.
-        log_every:            Log progress every N files.
-        verbose:              Log per-entry shapes at DEBUG level.
+        protein_list:         Optional path to a text file with one protein ID per line.
+                              When provided, only those proteins are processed.
+        n_cycle:              Protenix recycling cycles for MSA embedding extraction.
     """
     logger.info("build_lmdb started")
     logger.info("  a3m_dir    : %s", a3m_dir)
     logger.info("  output     : %s", output_path)
     logger.info("  max_seq_len: %d  max_msa_seqs: %d", max_seq_len, max_msa_seqs)
     logger.info("  device     : %s  map_size: %dGB", device, map_size_gb)
-    logger.info("  protenix   : %s", protenix_checkpoint or "disabled")
+    logger.info("  protenix   : %s  n_cycle: %d", protenix_checkpoint or "disabled", n_cycle)
 
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
 
-    # Load Protenix if checkpoint provided
+    # Load the FULL Protenix model if checkpoint provided (faithful path needs
+    # the whole trunk, not just the MSAModule)
     protenix_model = None
     if protenix_checkpoint is not None:
-        logger.info("Loading Protenix from %s ...", protenix_checkpoint)
-        sys.path.insert(0, str(Path(__file__).parents[3] / "Protenix"))
-        from protenix.model.protenix import Protenix
-        from omegaconf import OmegaConf
-        cfg = OmegaConf.load(Path(protenix_checkpoint).parent / "config.yaml")
-        protenix_model = Protenix(cfg).eval().to(dev)
-        state = torch.load(protenix_checkpoint, map_location=dev)
-        missing, unexpected = protenix_model.load_state_dict(state["model"], strict=False)
-        logger.info("Protenix loaded  (missing=%d  unexpected=%d)", len(missing), len(unexpected))
-        if missing:
-            logger.debug("Missing keys: %s", missing[:5])
+        sys.path.insert(0, str(Path(__file__).parents[2] / "Protenix"))
+        protenix_model = load_protenix_model(protenix_checkpoint, dev)
 
     # Load ESM2-650M
-    logger.info("Loading ESM2-650M ...")
-    sys.path.insert(0, str(Path(__file__).parents[3] / "esm"))
+    sys.path.insert(0, str(Path(__file__).parents[2] / "esm"))
     import esm as esm_lib
     esm_model, alphabet = esm_lib.pretrained.esm2_t33_650M_UR50D()
     esm_model = esm_model.eval().to(dev)
@@ -404,10 +473,14 @@ def build_lmdb(
         logger.info("ESM2 loaded  (CPU mode)")
 
     a3m_files = list(Path(a3m_dir).glob("**/*.a3m"))
-    logger.info("Found %d A3M files in %s", len(a3m_files), a3m_dir)
-    if not a3m_files:
-        logger.error("No .a3m files found — check a3m_dir path")
-        return
+    logger.info("Found %d A3M files total", len(a3m_files))
+
+    if protein_list is not None:
+        with open(protein_list) as f:
+            allowed_ids = {line.strip() for line in f if line.strip()}
+        a3m_files = [p for p in a3m_files if p.stem in allowed_ids]
+        logger.info("Filtered to %d A3M files from protein_list (%s)",
+                    len(a3m_files), protein_list)
 
     env = lmdb.open(
         output_path,
@@ -420,10 +493,10 @@ def build_lmdb(
     stats = PreprocessStats(n_total=len(a3m_files))
 
     for file_idx, a3m_path in enumerate(tqdm(a3m_files, desc="Building LMDB")):
-        key = a3m_path.stem
+        key = a3m_path.stem  # {pdb_id}__{chain_id}
         try:
             # ── Parse ────────────────────────────────────────────────────────
-            names, seqs = parse_a3m(str(a3m_path))
+            _names, seqs = parse_a3m(str(a3m_path))
             if not seqs:
                 stats.skip("empty_file")
                 continue
@@ -444,6 +517,11 @@ def build_lmdb(
             L_query = len(query_seq)
             if L_query == 0:
                 stats.skip("query_all_gaps")
+                continue
+            # Faithful featurization requires the first A3M record (query) to be
+            # gap-free so it matches the proteinChain sequence exactly.
+            if protenix_model is not None and "-" in seqs[0]:
+                stats.skip("query_has_gaps")
                 continue
 
             seqs = [s[:L_query] for s in seqs]
@@ -475,10 +553,10 @@ def build_lmdb(
                 logger.warning("[%s] ESM2 shape %s != L_query %d", key, esm_shape, L_query)
                 continue
 
-            # ── Protenix MSA embedding ───────────────────────────────────────
+            # Protenix MSA embedding (faithful full-trunk path)
             if protenix_model is not None:
                 entry["msa_emb"] = extract_msa_embedding_protenix(
-                    seqs[:max_msa_seqs], protenix_model, dev
+                    seqs[:max_msa_seqs], protenix_model, dev, n_cycle=n_cycle
                 ).half().numpy()
                 msa_shape = entry["msa_emb"].shape
                 if msa_shape[0] != L_query:
@@ -487,19 +565,15 @@ def build_lmdb(
                     continue
 
             # ── Write ────────────────────────────────────────────────────────
-            _log_entry_shapes(key, entry, verbose)
             with env.begin(write=True) as txn:
                 txn.put(key.encode(), pickle.dumps(entry))
             stats.record(L_query, N, weights)
 
         except Exception as exc:
-            stats.skip(f"exception:{type(exc).__name__}")
-            logger.warning("Skipped %s  [%s] %s", a3m_path.name, type(exc).__name__, exc)
-            if verbose:
-                logger.debug("Traceback:", exc_info=True)
-
-        if (file_idx + 1) % log_every == 0:
-            stats.log_progress(file_idx + 1)
+            logger.warning("Skipped %s: %s", key, exc)
+        finally:
+            if dev.type == "cuda":
+                torch.cuda.empty_cache()
 
     env.close()
     stats.log_summary()
@@ -525,14 +599,11 @@ if __name__ == "__main__":
     parser.add_argument("--max_seq_len",          type=int, default=1024)
     parser.add_argument("--device",               default="cuda")
     parser.add_argument("--map_size_gb",          type=int, default=500)
-    parser.add_argument("--log_every",            type=int, default=100,
-                        help="Log progress every N files")
-    parser.add_argument("--verbose",              action="store_true",
-                        help="Log per-entry shapes (sets log level to DEBUG)")
+    parser.add_argument("--protein_list",          default=None,
+                        help="Text file with one protein ID per line to process (optional)")
+    parser.add_argument("--n_cycle",              type=int, default=3,
+                        help="Protenix recycling cycles (3 = MSAFlow default)")
     args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
 
     build_lmdb(
         a3m_dir=args.a3m_dir,
@@ -542,6 +613,6 @@ if __name__ == "__main__":
         max_seq_len=args.max_seq_len,
         device=args.device,
         map_size_gb=args.map_size_gb,
-        log_every=args.log_every,
-        verbose=args.verbose,
+        protein_list=args.protein_list,
+        n_cycle=args.n_cycle,
     )

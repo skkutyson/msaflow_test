@@ -12,6 +12,7 @@ model:
 
 data:
   lmdb_path: /gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb
+  val_lmdb_path: /gpfs/deepfold/users/yjlee4/msaflow_fold.lmdb
   n_seqs_per_msa: 32      # Sequences sampled per MSA (paper: 32)
   max_seq_len: 1024
   batch_size: 1           # Per-GPU batch (number of MSAs) — reduced from 4 to avoid OOM
@@ -21,20 +22,23 @@ training:
   epochs: 21              # extended from 7: resume from epoch 7 checkpoint
   lr: 1.0e-5
   weight_decay: 0.1
-  warmup_steps: 5000
-  max_grad_norm: 10.0
+  warmup_steps: 700
+  max_grad_norm: 1.0
   grad_accumulation: 4
   seed: 42
   output_dir: /runs/decoder
-  resume: true            # resume from latest.pt
+  resume: false            # resume from latest.pt
   log_every: 100
-  ema_decay: 0.9999
+  ema_decay: 0.998
   use_ema: true
   mixed_precision: "bf16"
   use_wandb: true
   wandb_project: msaflow
-  wandb_run_name: decoder_d12_h768_lr1e5_msanorm_gradclip10_v4
+  wandb_run_name: decoder
   val_every: 1          # validate every N epochs (0 = disabled)
+  val_proteins: 1000    # number of proteins to sample from val_lmdb for validation
   val_ode_steps: 100    # Euler steps for ODE integration (paper: Δt=0.01 = 100 steps)
+  val_example_proteins: 3   # proteins to write sequence examples for (0 = disabled)
+  val_example_seqs: 5       # generated sequences per protein in examples
   t_max_eps: 0.01       # time truncation: t ∈ [0, 1-t_max_eps] to avoid log_map instability near t=1
                         # 0.01 → training covers [0, 0.99], matching inference Euler max t=(n_steps-1)/n_steps=0.99

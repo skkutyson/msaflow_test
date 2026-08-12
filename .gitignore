@@ -50,3 +50,23 @@ Thumbs.db
 # Large model weights (use git-lfs if needed)
 *.bin
 *.safetensors
+
+# Papers / large stray docs
+*.pdf
+
+# Ad-hoc data artifacts (not part of the pipeline)
+/foldbench_monomer.fasta
+/monomer_protein.csv
+/retry.txt
+/skipped_proteins.txt
+/check_lmdb.py
+/train.sh
+
+# Ad-hoc debug / inspection scripts (kept on disk, out of the repo)
+/scripts/check_a3m_structure.sh
+/scripts/check_openfold_msa.sh
+/scripts/compare_lmdb.sh
+/scripts/delete_lmdb_key.sh
+/scripts/find_low_msa.sh
+/scripts/compare_orphan_bench.py
+/scripts/fetch_foldbench_msa.py

@@ -21,6 +21,7 @@ import math
 import logging
 import argparse
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -29,21 +30,86 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, DataLoaderConfiguration
 from omegaconf import OmegaConf
 
 import numpy as np
 
-from msaflow.models.sfm_decoder import SFMDecoder, sfm_loss
+from msaflow.models.sfm_decoder import SFMDecoder, flow_loss
 from msaflow.data.dataset import MSADecoderDataset, decoder_collate_fn
+from msaflow.data.preprocessing import AA_LIST
 from msaflow.utils.spherical import sample_sphere_noise, euler_step_sphere, decode_sequences
+from msaflow.utils.alpha_geometry import geometry_ops as _geometry_ops
 
 logger = logging.getLogger(__name__)
+
+
+def _tokens_to_strs(tokens: torch.Tensor) -> list:
+    """Convert (B, L) integer token tensor to list of amino-acid strings."""
+    rows = tokens.cpu().tolist()
+    return ["".join(AA_LIST[t] if t < len(AA_LIST) else "?" for t in row) for row in rows]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Validation: generation quality metrics beyond loss
 # ──────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def _compute_gen_metrics(
+    gen_tokens: torch.Tensor,
+    ref_tokens: torch.Tensor,
+    vocab_size: int,
+    gap_token: int,
+    weights: Optional[torch.Tensor] = None,
+) -> dict:
+    """Compute generation metrics for a single set of generated tokens."""
+    device = gen_tokens.device
+    B, L = ref_tokens.shape
+
+    # seq_recovery: nearest-neighbor matching to avoid arbitrary i→i pairing.
+    # Generated sequences are permutation-invariant samples from the same
+    # conditioning; comparing gen[i] to ref[i] directly underestimates recovery
+    # when the sequences are in a different order.
+    # For each generated sequence, find the reference sequence with the highest
+    # per-position match and measure recovery against that best match.
+    match = (gen_tokens.unsqueeze(1) == ref_tokens.unsqueeze(0)).float()  # (B, B, L)
+    nn_recovery = match.mean(dim=-1).max(dim=1).values                    # (B,) best-ref per gen
+    seq_recovery = nn_recovery.mean().item()
+
+    gap_frac = (gen_tokens == gap_token).float().mean().item()
+
+    gen_np = gen_tokens.cpu().numpy()
+    diff = (gen_np[:, None, :] != gen_np[None, :, :]).mean(axis=-1)
+    counts = (diff < 0.2).sum(axis=1).astype(np.float32)
+    neff_generated = float((1.0 / counts.clip(min=1.0)).sum())
+
+    gen_oh = torch.zeros(B, L, vocab_size, device=device)
+    gen_oh.scatter_(2, gen_tokens.unsqueeze(-1), 1.0)
+    ref_oh = torch.zeros(B, L, vocab_size, device=device)
+    ref_oh.scatter_(2, ref_tokens.unsqueeze(-1), 1.0)
+
+    # Generated sequences: equal weight (no Neff for freshly sampled seqs).
+    gen_dist = gen_oh.mean(dim=0).clamp(min=1e-8)
+    # Reference distribution: Neff-weighted so redundant homologs don't dominate.
+    if weights is not None:
+        w = weights.to(device).float()
+        w = w / w.sum()
+        ref_dist = (ref_oh * w.view(B, 1, 1)).sum(dim=0).clamp(min=1e-8)
+    else:
+        ref_dist = ref_oh.mean(dim=0).clamp(min=1e-8)
+
+    gen_dist = gen_dist / gen_dist.sum(dim=-1, keepdim=True)
+    ref_dist = ref_dist / ref_dist.sum(dim=-1, keepdim=True)
+    kl = (ref_dist * (ref_dist.log() - gen_dist.log())).sum(dim=-1)
+    aa_kl_div = kl.mean().item()
+
+    return {
+        "seq_recovery":   seq_recovery,
+        "gap_frac":       gap_frac,
+        "neff_generated": neff_generated,
+        "aa_kl_div":      aa_kl_div,
+    }
+
 
 @torch.no_grad()
 def validate_generation(
@@ -52,26 +118,37 @@ def validate_generation(
     vocab_size: int,
     n_steps: int = 50,
     gap_token: int = 20,
+    temperatures: tuple = (0.0, 0.5, 1.0),
+    noise_fn=None,
+    step_fn=None,
+    decode_fn=None,
 ) -> dict:
     """
     Generate sequences via Euler integration and compute quality metrics.
 
-    Metrics logged:
-      val/seq_recovery   — fraction of tokens matching reference (accuracy)
-      val/gap_frac       — fraction of gap tokens in generated sequences
-      val/neff_generated — Neff of generated MSA (diversity indicator)
-      val/aa_kl_div      — mean per-position KL(generated ∥ reference AA dist)
+    Runs generation at each temperature in `temperatures`.  The t=0.0 (argmax)
+    results are always returned under the flat keys for backward compatibility:
+      val/seq_recovery, val/gap_frac, val/neff_generated, val/aa_kl_div
+
+    Additional temperature results are stored under:
+      val/t{temp}/seq_recovery, val/t{temp}/gap_frac, etc.
 
     Args:
-        model:      unwrapped SFMDecoder in eval mode.
-        val_batch:  dict with keys msa_emb (B,L,128), tokens (B,L).
-        vocab_size: V = 22.
-        n_steps:    Euler integration steps (50 is sufficient).
-        gap_token:  index of the gap '-' token.
+        model:        unwrapped SFMDecoder in eval mode.
+        val_batch:    dict with keys msa_emb (B,L,128), tokens (B,L).
+        vocab_size:   V = 22.
+        n_steps:      Euler integration steps (50 is sufficient).
+        gap_token:    index of the gap '-' token.
+        temperatures: decoding temperatures to evaluate.
 
     Returns:
         dict of scalar metrics.
     """
+    # Default to the α=0 sphere ops when none supplied (backward compatible).
+    noise_fn = noise_fn or (lambda shape, device, dtype: sample_sphere_noise(shape, device=device, dtype=dtype))
+    step_fn = step_fn or (lambda x, v, dt: euler_step_sphere(x, v, dt))
+    decode_fn = decode_fn or (lambda x, temperature: decode_sequences(x, temperature=temperature))
+
     model.eval()
     device = next(model.parameters()).device
 
@@ -79,50 +156,135 @@ def validate_generation(
     ref_tokens = val_batch["tokens"].to(device)  # (B, L)
     B, L = ref_tokens.shape
 
-    # ── ODE integration: x0 (noise) → x1 (generated) ─────────────────────────
-    x_t = sample_sphere_noise((B, L, vocab_size), device=device, dtype=msa_emb.dtype)
+    # ── ODE integration (shared across all temperatures) ─────────────────────
+    x_t = noise_fn((B, L, vocab_size), device, msa_emb.dtype)
     dt = 1.0 / n_steps
     for i in range(n_steps):
         t = torch.full((B,), i * dt, device=device, dtype=msa_emb.dtype)
         v = model(x_t, msa_emb, t)
-        x_t = euler_step_sphere(x_t, v, dt)
+        x_t = step_fn(x_t, v, dt)
 
-    # ── Decode to tokens ─────────────────────────────────────────────────────
-    gen_tokens = decode_sequences(x_t, temperature=0.0)  # (B, L) — argmax
+    weights = val_batch.get("weights")
+    if weights is not None:
+        weights = weights.to(device)
 
-    # ── Sequence recovery (token accuracy) ────────────────────────────────────
-    seq_recovery = (gen_tokens == ref_tokens).float().mean().item()
+    # ── Decode at each temperature and collect metrics ────────────────────────
+    metrics = {}
+    for temp in temperatures:
+        gen_tokens = decode_fn(x_t, temp)   # (B, L)
+        m = _compute_gen_metrics(gen_tokens, ref_tokens, vocab_size, gap_token, weights=weights)
 
-    # ── Gap fraction ──────────────────────────────────────────────────────────
-    gap_frac = (gen_tokens == gap_token).float().mean().item()
+        if temp == 0.0:
+            # flat keys for backward compat with existing logging / dashboards
+            for k, v in m.items():
+                metrics[f"val/{k}"] = v
+        else:
+            temp_str = f"{temp:.1f}".replace(".", "")  # "0.5" → "05"
+            for k, v in m.items():
+                metrics[f"val/t{temp_str}/{k}"] = v
 
-    # ── Neff of generated MSA ─────────────────────────────────────────────────
-    gen_np = gen_tokens.cpu().numpy()   # (B, L)
-    diff = (gen_np[:, None, :] != gen_np[None, :, :]).mean(axis=-1)   # (B, B)
-    counts = (diff < 0.2).sum(axis=1).astype(np.float32)
-    neff_generated = float((1.0 / counts.clip(min=1.0)).sum())
+    return metrics
 
-    # ── AA distribution KL divergence ─────────────────────────────────────────
-    # Per-position distribution comparison (non-gap positions only)
-    gen_oh = torch.zeros(B, L, vocab_size, device=device)
-    gen_oh.scatter_(2, gen_tokens.unsqueeze(-1), 1.0)
-    ref_oh = torch.zeros(B, L, vocab_size, device=device)
-    ref_oh.scatter_(2, ref_tokens.unsqueeze(-1), 1.0)
 
-    gen_dist = gen_oh.mean(dim=0).clamp(min=1e-8)   # (L, V) empirical freq
-    ref_dist = ref_oh.mean(dim=0).clamp(min=1e-8)   # (L, V)
-    gen_dist = gen_dist / gen_dist.sum(dim=-1, keepdim=True)
-    ref_dist = ref_dist / ref_dist.sum(dim=-1, keepdim=True)
+# ──────────────────────────────────────────────────────────────────────────────
+# Validation sequence example logger
+# ──────────────────────────────────────────────────────────────────────────────
 
-    kl = (ref_dist * (ref_dist.log() - gen_dist.log())).sum(dim=-1)  # (L,)
-    aa_kl_div = kl.mean().item()
+@torch.no_grad()
+def save_val_examples(
+    model: SFMDecoder,
+    val_items: list,
+    vocab_size: int,
+    epoch: int,
+    output_dir: Path,
+    n_proteins: int = 3,
+    n_seqs: int = 5,
+    n_steps: int = 50,
+    temperatures: tuple = (0.0, 0.5, 1.0),
+    noise_fn=None,
+    step_fn=None,
+    decode_fn=None,
+) -> Path:
+    """
+    Generate example MSA sequences for a few validation proteins and save to a text file.
 
-    return {
-        "val/seq_recovery":   seq_recovery,
-        "val/gap_frac":       gap_frac,
-        "val/neff_generated": neff_generated,
-        "val/aa_kl_div":      aa_kl_div,
-    }
+    For each of the first `n_proteins` proteins, runs ODE integration once and decodes
+    at each temperature, then writes reference + generated sequences side-by-side.
+
+    Returns the path to the saved file.
+    """
+    noise_fn = noise_fn or (lambda shape, device, dtype: sample_sphere_noise(shape, device=device, dtype=dtype))
+    step_fn = step_fn or (lambda x, v, dt: euler_step_sphere(x, v, dt))
+    decode_fn = decode_fn or (lambda x, temperature: decode_sequences(x, temperature=temperature))
+
+    model.eval()
+    device = next(model.parameters()).device
+
+    out_dir = output_dir / "val_examples"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"epoch_{epoch:03d}.txt"
+
+    SEP = "=" * 72
+
+    with open(out_file, "w") as f:
+        f.write(f"{SEP}\n")
+        f.write(f"Epoch {epoch}  —  Validation Sequence Examples\n")
+        f.write(f"temperatures: {temperatures}    ODE steps: {n_steps}\n")
+        f.write(f"{SEP}\n\n")
+
+        for pi, vb in enumerate(val_items[:n_proteins]):
+            msa_emb   = vb["msa_emb"].to(device)    # (B, L, 128)
+            ref_tokens = vb["tokens"].to(device)     # (B, L)
+            B, L = ref_tokens.shape
+            n = min(n_seqs, B)
+
+            # ── ODE integration (shared across all temperatures) ──────────────
+            emb = msa_emb[:n]                        # (n, L, 128)
+            x_t = noise_fn((n, L, vocab_size), device, emb.dtype)
+            dt = 1.0 / n_steps
+            for step_i in range(n_steps):
+                t = torch.full((n,), step_i * dt, device=device, dtype=emb.dtype)
+                v = model(x_t, emb, t)
+                x_t = step_fn(x_t, v, dt)
+
+            f.write(f"{'─'*72}\n")
+            f.write(f"Protein {pi}   (B={B} ref seqs, L={L} residues)\n")
+            f.write(f"{'─'*72}\n\n")
+
+            # Reference sequences
+            f.write("Reference (from val LMDB):\n")
+            for si, seq in enumerate(_tokens_to_strs(ref_tokens[:n])):
+                f.write(f"  ref[{si}]: {seq}\n")
+
+            # Generated sequences at each temperature
+            for temp in temperatures:
+                gen_tokens = decode_fn(x_t, temp)
+                label = f"t={temp:.1f}" + ("  (argmax)" if temp == 0.0 else "")
+                f.write(f"\nGenerated {label}:\n")
+                for si, seq in enumerate(_tokens_to_strs(gen_tokens)):
+                    f.write(f"  gen[{si}]: {seq}\n")
+
+            f.write("\n")
+
+    # ── stdout preview (protein 0 only, first 2 seqs, truncated to 60 chars) ──
+    vb0 = val_items[0]
+    ref0 = _tokens_to_strs(vb0["tokens"][:2])
+    logger.info("Val examples → %s", out_file)
+    logger.info("  [protein 0 | L=%d]  ref[0]: %.60s", vb0["tokens"].shape[1], ref0[0])
+
+    # Re-use x_t from the last ODE run (protein n_proteins-1); run fresh for protein 0
+    emb0 = vb0["msa_emb"].to(device)[:2]
+    L0   = vb0["tokens"].shape[1]
+    x0   = noise_fn((2, L0, vocab_size), device, emb0.dtype)
+    dt   = 1.0 / n_steps
+    for step_i in range(n_steps):
+        t = torch.full((2,), step_i * dt, device=device, dtype=emb0.dtype)
+        x0 = step_fn(x0, model(x0, emb0, t), dt)
+    for temp in temperatures:
+        gen0 = _tokens_to_strs(decode_fn(x0, temp))
+        logger.info("  [protein 0 | t=%.1f]  gen[0]: %.60s", temp, gen0[0])
+
+    return out_file
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -139,7 +301,10 @@ def get_lr_schedule(
     def _lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        # Clamp progress to 1.0: total_steps is an estimate, and without the
+        # clamp cos(pi*progress) rebounds upward for progress>1, raising the LR
+        # again past the end of the schedule.
+        progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return max(min_lr_ratio, cosine)
     return LambdaLR(optimizer, _lr_lambda, last_epoch=last_epoch)
@@ -159,18 +324,33 @@ class EMA:
     @torch.no_grad()
     def update(self, model: nn.Module):
         for name, param in model.named_parameters():
-            self.shadow[name] = self.shadow[name].to(param.device)
+            if name not in self.shadow:
+                self.shadow[name] = param.data.clone().detach()
+                continue
+            if self.shadow[name].device != param.device:
+                self.shadow[name] = self.shadow[name].to(param.device)
             self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
 
     def copy_to(self, model: nn.Module):
         for name, param in model.named_parameters():
-            param.data.copy_(self.shadow[name])
+            if name in self.shadow:
+                param.data.copy_(self.shadow[name])
 
     def state_dict(self):
-        return self.shadow
+        return {"shadow": self.shadow, "decay": self.decay}
 
     def load_state_dict(self, state):
-        self.shadow = state
+        # New format: {"shadow": {k: tensor}, "decay": float}
+        # Old format: {k: tensor} (backward compat)
+        if isinstance(state, dict) and "shadow" in state and isinstance(state["shadow"], dict):
+            loaded = state["shadow"]
+            self.decay = state.get("decay", self.decay)
+        else:
+            loaded = state
+        # Partial merge: update matching keys, keep current init for new/resized keys.
+        for k, v in loaded.items():
+            if k in self.shadow and v.shape == self.shadow[k].shape:
+                self.shadow[k] = v
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -181,6 +361,13 @@ def train(cfg):
     accelerator = Accelerator(
         gradient_accumulation_steps=cfg.training.grad_accumulation,
         mixed_precision=cfg.training.get("mixed_precision", "bf16"),
+        # use_seedable_sampler replaces the default generator-broadcast RNG sync with a
+        # deterministic per-epoch seed.  The broadcast relies on sampler.generator being
+        # seeded consistently across ranks, which breaks in Accelerate ≥1.0 when each
+        # rank draws its seed from the global CPU RNG after prepare().  The result is an
+        # inconsistent rng_types list: rank 0 skips the BROADCAST while other ranks
+        # block on it, causing a 10-min NCCL timeout.
+        dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True),
     )
     set_seed(cfg.training.seed)
 
@@ -189,6 +376,11 @@ def train(cfg):
         format="%(asctime)s  [ %(name)s ]  %(message)s",
         datefmt="%Y-%m-%d %H:%M",
     )
+
+    # ── Geometry (α-Flow) ──────────────────────────────────────────────────────
+    # Single unified path: p = 2/(1-α).  α=0 → L² sphere (SFM), α=0.5 → L⁴ sphere.
+    alpha = float(cfg.model.get("alpha", 0.0))
+    noise_fn, step_fn, decode_fn = _geometry_ops(alpha)
 
     # ── Model ────────────────────────────────────────────────────────────────
     model = SFMDecoder(
@@ -199,11 +391,13 @@ def train(cfg):
         num_heads=cfg.model.num_heads,
         mlp_ratio=cfg.model.mlp_ratio,
         max_seq_len=cfg.model.max_seq_len,
+        alpha=alpha,
     )
     n_params = sum(p.numel() for p in model.parameters())
     if accelerator.is_main_process:
-        logger.info("SFM decoder  ----- %.1fM params  depth=%d  hidden=%d  vocab=%d",
-                     n_params / 1e6, cfg.model.depth, cfg.model.hidden_size, cfg.model.vocab_size)
+        logger.info("SFM decoder  ----- %.1fM params  depth=%d  hidden=%d  vocab=%d  alpha=%.2f (p=%.2f)",
+                     n_params / 1e6, cfg.model.depth, cfg.model.hidden_size, cfg.model.vocab_size,
+                     alpha, 2.0 / (1.0 - alpha))
 
     ema = EMA(model, decay=cfg.training.ema_decay) if cfg.training.use_ema else None
 
@@ -261,20 +455,44 @@ def train(cfg):
     ckpt_path = output_dir / "latest.pt"
     if ckpt_path.exists() and cfg.training.resume:
         ckpt = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        # Reset optimizer LR to cfg value — load_state_dict restores the old (near-zero) LR.
-        for pg in optimizer.param_groups:
-            pg["lr"] = cfg.training.lr
-        # Rebuild scheduler with the (possibly extended) total_steps.
-        # Pass last_epoch=global_step so LambdaLR resumes at the correct
-        # position on the cosine curve without a slow for-loop fast-forward.
+        # Partial load: only restore keys whose shape matches the current model.
+        # Handles architecture changes (new block_cond_projs, FinalLayer gate,
+        # LayerNorm→RMSNorm) without crashing. New/resized keys keep their
+        # zero-initialized values, which is correct for these additions.
+        ckpt_sd = ckpt["model"]
+        model_sd = model.state_dict()
+        compatible = {k: v for k, v in ckpt_sd.items()
+                      if k in model_sd and v.shape == model_sd[k].shape}
+        skipped = [k for k in ckpt_sd if k not in compatible]
+        new_keys = [k for k in model_sd if k not in ckpt_sd]
+        model.load_state_dict(compatible, strict=False)
+        if accelerator.is_main_process:
+            if skipped:
+                logger.info("Resume: skipped %d checkpoint keys (shape mismatch / removed): %s",
+                            len(skipped), skipped)
+            if new_keys:
+                logger.info("Resume: %d new keys initialised from scratch: %s",
+                            len(new_keys), new_keys)
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            # Reset optimizer LR to cfg value — load_state_dict restores the old (near-zero) LR.
+            for pg in optimizer.param_groups:
+                pg["lr"] = cfg.training.lr
+        except ValueError as e:
+            # Param count changed (e.g. new block_cond_projs added) — optimizer
+            # state is incompatible. Start fresh; momentum buffers rebuild in ~1 epoch.
+            if accelerator.is_main_process:
+                logger.warning("Optimizer state incompatible, starting fresh: %s", e)
+        # Rebuild scheduler from scratch, then directly set _step_count.
+        # LambdaLR(last_epoch=N) internally calls step() N times — O(N) loop
+        # that takes minutes when resuming from step 50000+.
+        # Setting _step_count directly is equivalent and instant.
         scheduler = get_lr_schedule(
             optimizer,
             warmup_steps=cfg.training.warmup_steps,
             total_steps=total_steps,
-            last_epoch=ckpt["global_step"],
         )
+        scheduler._step_count = ckpt["global_step"] + 1
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt["global_step"]
         if ema is not None and "ema" in ckpt:
@@ -289,7 +507,7 @@ def train(cfg):
     )
 
     # ── Optional wandb ────────────────────────────────────────────────────────
-    use_wandb = cfg.training.get("use_wandb", False)
+    use_wandb = cfg.training.get("use_wandb", False) and bool(os.environ.get("WANDB_API_KEY"))
     if accelerator.is_main_process and use_wandb:
         import wandb
         wandb.init(
@@ -303,15 +521,42 @@ def train(cfg):
             log_freq=cfg.training.log_every,
         )
 
-    # ── Validation batch (fixed single MSA for consistent comparison) ──────────
-    # We use a single MSA (not collated) so that Neff and KL are meaningful
-    # within a protein family, not across mixed families.
-    val_every = cfg.training.get("val_every", 0)   # 0 = no validation
-    val_item = None
+    # ── Validation proteins (K fixed proteins, selected once at training start) ──
+    val_every = cfg.training.get("val_every", 0)
+    val_items = []
     if val_every > 0 and accelerator.is_main_process:
-        # dataset may be a Subset — use .dataset[0] if so
-        raw = dataset.dataset[0] if hasattr(dataset, "dataset") else dataset[0]
-        val_item = raw  # fixed entry: msa_emb (L,128), tokens (n_seqs,L)
+        K = cfg.training.get("val_proteins", 16)
+        val_lmdb_path = cfg.data.get("val_lmdb_path", None)
+        if val_lmdb_path:
+            val_ds = MSADecoderDataset(
+                lmdb_path=val_lmdb_path,
+                n_seqs_per_msa=cfg.data.n_seqs_per_msa,
+                max_seq_len=cfg.data.max_seq_len,
+            )
+            logger.info("Validation dataset: %s  (%d entries)", val_lmdb_path, len(val_ds))
+        else:
+            val_ds = dataset.dataset if hasattr(dataset, "dataset") else dataset
+        n_total = len(val_ds)
+        rng = np.random.default_rng(seed=cfg.training.seed)
+        val_indices = rng.choice(n_total, size=min(K, n_total), replace=False).tolist()
+        for idx in val_indices:
+            raw = val_ds[idx]
+            n_seqs = raw["tokens"].shape[0]
+            val_items.append({
+                "msa_emb": raw["msa_emb"].unsqueeze(0).expand(n_seqs, -1, -1),
+                "tokens":  raw["tokens"],
+                "weights": raw.get("weights"),
+            })
+        logger.info("Validation: %d proteins selected from %s (indices %s...)",
+                    len(val_items),
+                    val_lmdb_path or "train dataset",
+                    val_indices[:4])
+
+    # Ensure all ranks are in sync before entering the training loop.
+    # Rank 0 may have spent time loading the validation dataset above;
+    # without this barrier the other ranks enter the DataLoader iterator first
+    # and hang in synchronize_rng_states (BROADCAST) waiting for rank 0.
+    accelerator.wait_for_everyone()
 
     # ── Training loop ─────────────────────────────────────────────────────────
     if accelerator.is_main_process:
@@ -336,10 +581,16 @@ def train(cfg):
                 pos = torch.arange(L_max, device=tokens.device).unsqueeze(0)  # (1, L)
                 padding_mask = pos < seq_lengths.unsqueeze(1)                 # (B_flat, L)
 
-                loss = sfm_loss(
-                    accelerator.unwrap_model(model),
+                # Pass the *wrapped* model so DDP.forward() arms gradient
+                # all-reduce and the Accelerate bf16 autocast patch applies.
+                # vocab_size is passed explicitly because the wrapped module
+                # does not expose `.vocab_size`.  One loss for all α (α=0 → SFM).
+                loss = flow_loss(
+                    model,
                     tokens,
                     msa_emb,
+                    vocab_size=cfg.model.vocab_size,
+                    alpha=alpha,
                     weights=weights,
                     padding_mask=padding_mask,
                     t_max_eps=cfg.training.get("t_max_eps", 0.01),
@@ -351,10 +602,10 @@ def train(cfg):
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), cfg.training.max_grad_norm)
 
                 optimizer.step()
-                scheduler.step()
                 optimizer.zero_grad()
 
                 if accelerator.sync_gradients:
+                    scheduler.step()
                     global_step += 1
                     if ema is not None:
                         ema.update(accelerator.unwrap_model(model))
@@ -380,30 +631,56 @@ def train(cfg):
 
         # ── Validation ───────────────────────────────────────────────────────
         if val_every > 0 and (epoch + 1) % val_every == 0 and accelerator.is_main_process:
-            # val_item: single MSA — msa_emb (L,128), tokens (n_seqs,L)
-            # Expand msa_emb to match each sequence: (n_seqs, L, 128)
-            n_seqs_val = val_item["tokens"].shape[0]
-            val_batch = {
-                "msa_emb": val_item["msa_emb"].unsqueeze(0).expand(n_seqs_val, -1, -1),
-                "tokens":  val_item["tokens"],
-            }
-            val_metrics = validate_generation(
-                accelerator.unwrap_model(model),
-                val_batch,
-                vocab_size=cfg.model.vocab_size,
-                n_steps=cfg.training.get("val_ode_steps", 50),
-            )
-            logger.info(
-                "Epoch %d val | recovery=%.3f  gap=%.3f  neff=%.1f  kl=%.4f",
-                epoch,
-                val_metrics["val/seq_recovery"],
-                val_metrics["val/gap_frac"],
-                val_metrics["val/neff_generated"],
-                val_metrics["val/aa_kl_div"],
-            )
-            if use_wandb:
-                import wandb
-                wandb.log(val_metrics, step=global_step)
+            per_protein = [
+                validate_generation(
+                    accelerator.unwrap_model(model),
+                    vb,
+                    vocab_size=cfg.model.vocab_size,
+                    n_steps=cfg.training.get("val_ode_steps", 50),
+                    noise_fn=noise_fn,
+                    step_fn=step_fn,
+                    decode_fn=decode_fn,
+                )
+                for vb in val_items
+            ]
+            if per_protein:
+                val_metrics = {
+                    k: float(np.mean([m[k] for m in per_protein]))
+                    for k in per_protein[0]
+                }
+                t05 = "val/t05"
+                logger.info(
+                    "Epoch %d val (%d proteins) | t=0 recovery=%.3f gap=%.3f kl=%.4f"
+                    " | t=0.5 recovery=%.3f gap=%.3f kl=%.4f",
+                    epoch, len(val_items),
+                    val_metrics["val/seq_recovery"],
+                    val_metrics["val/gap_frac"],
+                    val_metrics["val/aa_kl_div"],
+                    val_metrics.get(f"{t05}/seq_recovery", float("nan")),
+                    val_metrics.get(f"{t05}/gap_frac", float("nan")),
+                    val_metrics.get(f"{t05}/aa_kl_div", float("nan")),
+                )
+                if use_wandb:
+                    import wandb
+                    wandb.log(val_metrics, step=global_step)
+
+            # ── Save sequence examples ────────────────────────────────────────
+            n_ex_proteins = cfg.training.get("val_example_proteins", 3)
+            n_ex_seqs     = cfg.training.get("val_example_seqs", 5)
+            if n_ex_proteins > 0 and val_items:
+                save_val_examples(
+                    accelerator.unwrap_model(model),
+                    val_items,
+                    vocab_size=cfg.model.vocab_size,
+                    epoch=epoch,
+                    output_dir=output_dir,
+                    n_proteins=n_ex_proteins,
+                    n_seqs=n_ex_seqs,
+                    n_steps=cfg.training.get("val_ode_steps", 50),
+                    noise_fn=noise_fn,
+                    step_fn=step_fn,
+                    decode_fn=decode_fn,
+                )
             model.train()
 
         # ── Checkpoint ───────────────────────────────────────────────────────
@@ -415,6 +692,10 @@ def train(cfg):
                 "scheduler": scheduler.state_dict(),
                 "epoch": epoch,
                 "global_step": global_step,
+                # α is not a weight (it only parameterises the Lᵖ geometry), so it
+                # must be stored explicitly for inference to reconstruct the model
+                # with the matching tangent projection / decode geometry.
+                "alpha": alpha,
             }
             if ema is not None:
                 ckpt["ema"] = ema.state_dict()
@@ -447,7 +728,8 @@ def train(cfg):
             # Save EMA weights as the final model
             unwrapped = accelerator.unwrap_model(model)
             ema.copy_to(unwrapped)
-            torch.save({"model": unwrapped.state_dict()}, output_dir / "decoder_ema_final.pt")
+            torch.save({"model": unwrapped.state_dict(), "alpha": alpha},
+                       output_dir / "decoder_ema_final.pt")
         if use_wandb:
             import wandb
             wandb.finish()
@@ -459,14 +741,17 @@ def train(cfg):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config",     required=True,  help="Path to decoder.yaml config")
-    parser.add_argument("--lmdb_path",  default=None,   help="Override data.lmdb_path")
-    parser.add_argument("--output_dir", default=None,   help="Override training.output_dir")
+    parser.add_argument("--config",        required=True,  help="Path to decoder.yaml config")
+    parser.add_argument("--lmdb_path",     default=None,   help="Override data.lmdb_path")
+    parser.add_argument("--val_lmdb_path", default=None,   help="Override data.val_lmdb_path")
+    parser.add_argument("--output_dir",    default=None,   help="Override training.output_dir")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
     if args.lmdb_path:
         cfg.data.lmdb_path = args.lmdb_path
+    if args.val_lmdb_path:
+        cfg.data.val_lmdb_path = args.val_lmdb_path
     if args.output_dir:
         cfg.training.output_dir = args.output_dir
 

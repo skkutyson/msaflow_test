@@ -18,7 +18,6 @@ where g_t = sqrt(2t/(1−t)) is the diffusion coefficient.
 """
 
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -151,21 +150,15 @@ def rectified_flow_loss(
     z1: torch.Tensor,
     esm_emb: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Compute rectified flow loss (Eq. 6 in paper).
+    """Rectified flow loss (Eq. 6):
 
-    L_RFM = E_{t, z_0~N(0,I), z_1}[‖v_θ(z_t, e, t) − (z_0 − z_1)‖²]
+        L_RFM = E_{t, z_0~N(0,I), z_1}[‖v_θ(z_t, e, t) − (z_0 − z_1)‖²]
 
-    The straight-line path is z_t = (1-t)·z_1 + t·z_0, so the reference
-    velocity is the constant field u*(z_t; z_0, z_1) = z_0 − z_1.
+    Straight-line path z_t = (1-t)·z_1 + t·z_0, so the reference velocity is the
+    constant field u*(z_t; z_0, z_1) = z_0 − z_1.
 
-    Args:
-        model:   LatentFMEncoder.
-        z1:      (B, L, msa_dim) ground-truth MSA embedding.
-        esm_emb: (B, L, esm_dim) ESM2 embedding of query sequence.
-
-    Returns:
-        loss: scalar.
+    z1 (B, L, msa_dim) ground-truth MSA embedding, esm_emb (B, L, esm_dim) query
+    ESM2 embedding. Returns a scalar loss.
     """
     B = z1.shape[0]
     device = z1.device

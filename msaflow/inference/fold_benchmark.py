@@ -3,7 +3,7 @@ MSAFlow Fold Benchmark — pLDDT / TM-score evaluation.
 
 Pipeline (mirrors paper Section 4.1 / Table 2 evaluation):
   1. Read test proteins (FASTA, one sequence per entry).
-  2. Generate MSA sequences via one of three modes:
+  2. Generate MSA sequences via one of four modes:
 
        zeroshot  — 10 seeds × 32 seqs each (Section 4.2 protocol):
                    fold each seed's MSA separately with Protenix, report best pLDDT.
@@ -11,6 +11,11 @@ Pipeline (mirrors paper Section 4.1 / Table 2 evaluation):
        fewshot   — Syn+Rec augmentation of a shallow MSA (Section 4.2):
                    requires --shallow_msa_dir and optionally --protenix_ckpt.
                    Folds the combined augmented MSA once.
+
+       shallow   — Orphan protein baseline: fold with the original sparse MSA
+                   as-is (no augmentation). Requires --shallow_msa_dir.
+                   Use this to measure TM-score BEFORE MSAFlow augmentation,
+                   then compare against fewshot to quantify the uplift.
 
        nomsa     — Baseline: skip MSA generation, fold with sequence only.
 
@@ -46,6 +51,15 @@ Usage (few-shot):
         --mode           fewshot \\
         --shallow_msa_dir data/shallow_msas/ \\
         [--protenix_ckpt  runs/protenix/protenix_base.pt]
+
+Usage (shallow / orphan baseline):
+    python msaflow/inference/fold_benchmark.py \\
+        --fasta           data/orphan_proteins.fasta \\
+        --decoder_ckpt    dummy  --latent_fm_ckpt dummy \\
+        --output_dir      runs/orphan_shallow \\
+        --mode            shallow \\
+        --shallow_msa_dir data/shallow_msas/ \\
+        --ref_pdb_dir     data/reference_pdbs/
 """
 
 import argparse
@@ -278,6 +292,24 @@ def compute_tmscore(
         return float("nan"), float("nan")
 
 
+def _maybe_tmscore(args, prot_name: str, cif: Optional[str]) -> tuple[float, float]:
+    """
+    Compute TM-score/RMSD of a predicted CIF against the reference structure,
+    if --ref_pdb_dir is set and a {prot_name}.pdb or .cif reference exists.
+    Returns (nan, nan) otherwise.
+    """
+    if not (args.ref_pdb_dir and cif):
+        return float("nan"), float("nan")
+    ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.pdb"
+    if not ref_pdb.exists():
+        ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.cif"
+    if not ref_pdb.exists():
+        return float("nan"), float("nan")
+    tm_score, rmsd = compute_tmscore(cif, str(ref_pdb), args.tmscore_bin)
+    logger.info("  TM-score=%.4f  RMSD=%.2f Å", tm_score, rmsd)
+    return tm_score, rmsd
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-protein folding helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -360,8 +392,9 @@ def run_benchmark(args):
     msa_dir.mkdir(exist_ok=True)
     fold_dir.mkdir(exist_ok=True)
 
-    # ── Load models (skip in nomsa baseline mode) ──────────────────────────────
-    if mode != "nomsa":
+    # ── Load models (skip for modes that don't generate sequences) ────────────
+    _generation_modes = {"zeroshot", "fewshot"}
+    if mode in _generation_modes:
         logger.info("Loading SFM decoder from %s", args.decoder_ckpt)
         sys.path.insert(0, str(Path(__file__).parents[2]))
         from msaflow.inference.generate import (
@@ -386,7 +419,7 @@ def run_benchmark(args):
 
         logger.info("All models loaded.")
     else:
-        logger.info("No-MSA baseline mode: skipping MSA model loading.")
+        logger.info("Mode=%s: skipping MSA generation model loading.", mode)
 
     # ── Read test proteins ─────────────────────────────────────────────────────
     proteins = parse_fasta(args.fasta)
@@ -450,14 +483,7 @@ def run_benchmark(args):
 
             logger.info("  Best seed=%d  pLDDT=%.2f", best_seed, best_plddt)
 
-            tm_score, rmsd = float("nan"), float("nan")
-            if args.ref_pdb_dir and best_cif:
-                ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.pdb"
-                if not ref_pdb.exists():
-                    ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.cif"
-                if ref_pdb.exists():
-                    tm_score, rmsd = compute_tmscore(best_cif, str(ref_pdb), args.tmscore_bin)
-                    logger.info("  TM-score=%.4f  RMSD=%.2f Å", tm_score, rmsd)
+            tm_score, rmsd = _maybe_tmscore(args, prot_name, best_cif)
 
             results.append({
                 "name": prot_name, "seq_len": len(query_seq),
@@ -495,7 +521,7 @@ def run_benchmark(args):
                         shallow_seqs=shallow_seqs,
                         decoder=decoder,
                         latent_fm=latent_fm,
-                        protenix_model=protenix_model,   # None → Syn track only
+                        msa_module=protenix_model,   # None → Syn track only
                         esm_model=esm_model,
                         alphabet=alphabet,
                         n_syn_seeds=args.n_seeds,
@@ -529,17 +555,58 @@ def run_benchmark(args):
             )
             logger.info("  pLDDT=%.2f", plddt)
 
-            tm_score, rmsd = float("nan"), float("nan")
-            if args.ref_pdb_dir and cif:
-                ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.pdb"
-                if not ref_pdb.exists():
-                    ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.cif"
-                if ref_pdb.exists():
-                    tm_score, rmsd = compute_tmscore(cif, str(ref_pdb), args.tmscore_bin)
-                    logger.info("  TM-score=%.4f  RMSD=%.2f Å", tm_score, rmsd)
+            tm_score, rmsd = _maybe_tmscore(args, prot_name, cif)
 
             results.append({
                 "name": prot_name, "seq_len": len(query_seq),
+                "plddt": plddt, "best_seed": -1,
+                "tm_score": tm_score, "rmsd": rmsd,
+                "status": "ok" if not np.isnan(plddt) else "failed",
+            })
+
+        # ── Shallow baseline (orphan proteins): fold with real sparse MSA as-is ──
+        elif mode == "shallow":
+            shallow_seqs = None
+            if args.shallow_msa_dir:
+                shallow_a3m = Path(args.shallow_msa_dir) / f"{prot_name}.a3m"
+                if shallow_a3m.exists():
+                    shallow_seqs = parse_a3m_seqs(str(shallow_a3m))
+                    logger.info("  Loaded shallow MSA: %d seqs from %s",
+                                len(shallow_seqs), shallow_a3m)
+                else:
+                    logger.warning("  Shallow A3M not found: %s; falling back to depth-1",
+                                   shallow_a3m)
+
+            if not shallow_seqs:
+                shallow_seqs = [query_seq]
+                logger.info("  Using depth-1 shallow MSA (query only)")
+
+            # Write the original sparse MSA into the output tree (for reproducibility)
+            prot_msa_dir = msa_dir / prot_name
+            prot_msa_dir.mkdir(exist_ok=True)
+            sparse_a3m = prot_msa_dir / "sparse.a3m"
+            if not sparse_a3m.exists() or args.regenerate:
+                with open(sparse_a3m, "w") as fh:
+                    fh.write(f">query\n{query_seq}\n")
+                    for i, s in enumerate(shallow_seqs[1:], 1):
+                        fh.write(f">hit_{i}\n{s}\n")
+
+            plddt, cif = fold_once(
+                prot_name=prot_name,
+                query_seq=query_seq,
+                a3m_path=sparse_a3m,
+                fold_dir=fold_dir,
+                args=args,
+                use_msa=True,
+                tag="_shallow",
+            )
+            logger.info("  pLDDT=%.2f  n_msa=%d", plddt, len(shallow_seqs))
+
+            tm_score, rmsd = _maybe_tmscore(args, prot_name, cif)
+
+            results.append({
+                "name": prot_name, "seq_len": len(query_seq),
+                "n_msa": len(shallow_seqs),
                 "plddt": plddt, "best_seed": -1,
                 "tm_score": tm_score, "rmsd": rmsd,
                 "status": "ok" if not np.isnan(plddt) else "failed",
@@ -558,14 +625,7 @@ def run_benchmark(args):
             )
             logger.info("  pLDDT=%.2f", plddt)
 
-            tm_score, rmsd = float("nan"), float("nan")
-            if args.ref_pdb_dir and cif:
-                ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.pdb"
-                if not ref_pdb.exists():
-                    ref_pdb = Path(args.ref_pdb_dir) / f"{prot_name}.cif"
-                if ref_pdb.exists():
-                    tm_score, rmsd = compute_tmscore(cif, str(ref_pdb), args.tmscore_bin)
-                    logger.info("  TM-score=%.4f  RMSD=%.2f Å", tm_score, rmsd)
+            tm_score, rmsd = _maybe_tmscore(args, prot_name, cif)
 
             results.append({
                 "name": prot_name, "seq_len": len(query_seq),
@@ -577,7 +637,10 @@ def run_benchmark(args):
     # ── Write CSV summary ──────────────────────────────────────────────────────
     shard_suffix = f"_shard{args.shard_id}" if args.num_shards > 1 else ""
     csv_path = output_dir / f"shard{shard_suffix}.csv"
-    fieldnames = ["name", "seq_len", "plddt", "best_seed", "tm_score", "rmsd", "status"]
+    fieldnames = ["name", "seq_len", "n_msa", "plddt", "best_seed", "tm_score", "rmsd", "status"]
+    # backfill n_msa for modes that don't set it
+    for r in results:
+        r.setdefault("n_msa", float("nan"))
     with open(csv_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
@@ -618,8 +681,8 @@ def main():
     parser.add_argument("--output_dir",      required=True,
                         help="Root directory for MSA files, fold outputs, and CSV")
     parser.add_argument("--mode",            default="zeroshot",
-                        choices=["zeroshot", "fewshot", "nomsa"],
-                        help="Generation mode: zeroshot | fewshot | nomsa (default: zeroshot)")
+                        choices=["zeroshot", "fewshot", "shallow", "nomsa"],
+                        help="Generation mode: zeroshot | fewshot | shallow | nomsa (default: zeroshot)")
     parser.add_argument("--ref_pdb_dir",     default=None,
                         help="Directory with reference PDB files named {name}.pdb")
     parser.add_argument("--device",          default="cuda")

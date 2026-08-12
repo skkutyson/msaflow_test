@@ -20,41 +20,18 @@ import torch.nn.functional as F
 # ─────────────────────────────────────────────────────────────────────────────
 
 def simplex_to_sphere(mu: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Map probability vectors to the positive orthant of the unit sphere.
-
-    Args:
-        mu: (..., V) probability vectors (sum to 1, non-negative).
-
-    Returns:
-        x: (..., V) unit-sphere points, x = sqrt(µ).
-    """
+    """Map probability vectors (..., V) to the positive orthant of the unit sphere, x = √µ."""
     return torch.sqrt(mu.clamp(min=eps))
 
 
 def sphere_to_simplex(x: torch.Tensor) -> torch.Tensor:
-    """Map sphere points back to probability vectors.
-
-    Args:
-        x: (..., V) unit-sphere points.
-
-    Returns:
-        mu: (..., V) probability vectors, µ = x².
-    """
+    """Map sphere points (..., V) back to probability vectors, µ = x² (re-normalised for fp drift)."""
     mu = x ** 2
-    # Re-normalise to correct for floating point drift
     return mu / mu.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
 
 def onehot_to_sphere(tokens: torch.Tensor, vocab_size: int, eps: float = 1e-8) -> torch.Tensor:
-    """Convert integer token ids to sphere points via one-hot → √.
-
-    Args:
-        tokens: (..., L) integer token ids.
-        vocab_size: V.
-
-    Returns:
-        x: (..., L, V) sphere points.
-    """
+    """Integer token ids (..., L) → sphere points (..., L, V) via one-hot → √."""
     one_hot = F.one_hot(tokens.long(), num_classes=vocab_size).float()
     return simplex_to_sphere(one_hot, eps=eps)
 
@@ -64,32 +41,18 @@ def onehot_to_sphere(tokens: torch.Tensor, vocab_size: int, eps: float = 1e-8) -
 # ─────────────────────────────────────────────────────────────────────────────
 
 def exp_map(x: torch.Tensor, u: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Spherical exponential map: move from x in tangent direction u.
+    """Spherical exponential map at x along tangent u (..., V):
 
-    exp_x(u) = x·cos(‖u‖) + (u/‖u‖)·sin(‖u‖)
-
-    Args:
-        x: (..., V) base point on unit sphere.
-        u: (..., V) tangent vector at x.
-
-    Returns:
-        y: (..., V) resulting point on unit sphere.
+        exp_x(u) = x·cos(‖u‖) + (u/‖u‖)·sin(‖u‖)
     """
     norm_u = torch.norm(u, dim=-1, keepdim=True).clamp(min=eps)
     return x * torch.cos(norm_u) + (u / norm_u) * torch.sin(norm_u)
 
 
 def log_map(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Spherical logarithmic map: tangent vector at x pointing toward y.
+    """Spherical logarithmic map: tangent vector at x pointing toward y (..., V):
 
-    log_x(y) = arccos(<x,y>) / √(1 − <x,y>²) · (y − <x,y>·x)
-
-    Args:
-        x: (..., V) base point on unit sphere.
-        y: (..., V) target point on unit sphere.
-
-    Returns:
-        u: (..., V) tangent vector at x.
+        log_x(y) = arccos(<x,y>) / √(1 − <x,y>²) · (y − <x,y>·x)
     """
     dot = (x * y).sum(dim=-1, keepdim=True).clamp(-1.0 + eps, 1.0 - eps)
     theta = torch.acos(dot)                              # geodesic distance
@@ -108,19 +71,10 @@ def geodesic_interpolate(
     t: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Spherical geodesic interpolation.
+    """Spherical geodesic interpolation, x_t = exp_{x0}(t · log_{x0}(x1)).
 
-    x_t = exp_{x0}(t · log_{x0}(x1))
-
-    t=0 → x0 (noise), t=1 → x1 (data).
-
-    Args:
-        x0: (..., V) noise point on unit sphere.
-        x1: (..., V) data point on unit sphere.
-        t:  (..., 1) or scalar interpolation parameter in [0,1].
-
-    Returns:
-        x_t: (..., V) interpolated point on unit sphere.
+    x0 (..., V) noise, x1 (..., V) data, t (..., 1) or scalar in [0,1].
+    t=0 → x0, t=1 → x1. Returns x_t (..., V).
     """
     u = log_map(x0, x1, eps=eps)   # tangent direction from x0 toward x1
     return exp_map(x0, t * u, eps=eps)
@@ -132,17 +86,11 @@ def target_velocity(
     t: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Conditional target velocity field for SFM training.
+    """Conditional target velocity field for SFM training (tangent at x_t):
 
-    u_t(x_t | x1) = log_{x_t}(x1) / (1 − t)
+        u_t(x_t | x1) = log_{x_t}(x1) / (1 − t)
 
-    Args:
-        x_t: (..., V) interpolated point on unit sphere at time t.
-        x1:  (..., V) data point on unit sphere.
-        t:   (..., 1) time in [0, 1).
-
-    Returns:
-        u: (..., V) target velocity vector (in tangent space at x_t).
+    x_t, x1 (..., V); t (..., 1) in [0, 1). Returns u (..., V).
     """
     log = log_map(x_t, x1, eps=eps)
     denom = (1.0 - t).clamp(min=eps)
@@ -154,19 +102,8 @@ def target_velocity(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sample_sphere_noise(shape: tuple, device=None, dtype=torch.float32) -> torch.Tensor:
-    """Sample uniform noise on the positive orthant of the unit sphere.
-
-    Corresponds to µ_0 ~ Dirichlet(1) mapped through π.
-
-    Args:
-        shape: (..., V) desired output shape.
-        device: torch device.
-        dtype: torch dtype.
-
-    Returns:
-        x: (*shape) unit-sphere points with positive components.
-    """
-    # Sample Dirichlet(1) = Uniform on simplex, then map to sphere
+    """Sample µ_0 ~ Dirichlet(1) (uniform on simplex) and map through π to the
+    positive orthant of the unit sphere. Returns (*shape) with positive components."""
     noise = -torch.log(torch.rand(*shape, device=device, dtype=dtype).clamp(min=1e-8))
     mu = noise / noise.sum(dim=-1, keepdim=True)   # normalise to simplex
     return simplex_to_sphere(mu)
@@ -182,30 +119,17 @@ def euler_step_sphere(
     dt: float,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """One Euler step on the sphere in the direction of velocity v.
+    """One Euler step on the sphere, x_{t+dt} = exp_{x_t}(v · dt).
 
-    x_{t+dt} = exp_{x_t}(v · dt)
-
-    Args:
-        x_t: (..., V) current point on unit sphere.
-        v:   (..., V) velocity vector (tangent at x_t).
-        dt:  step size.
-
-    Returns:
-        x_next: (..., V) next point on unit sphere.
+    x_t (..., V) current point, v (..., V) tangent velocity, dt step size.
     """
     return exp_map(x_t, v * dt, eps=eps)
 
 
 def decode_sequences(x1: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-    """Decode sphere points to discrete amino acid tokens.
+    """Decode sphere points x1 (..., L, V) to token ids (..., L).
 
-    Args:
-        x1:          (..., L, V) final sphere points.
-        temperature: sampling temperature (0 = argmax, 1.0 = unmodified, >1 = diverse).
-
-    Returns:
-        tokens: (..., L) integer token ids.
+    temperature: 0 = argmax, 1.0 = unmodified, >1 = diverse.
     """
     mu = sphere_to_simplex(x1)      # (..., L, V) probabilities
     if temperature <= 0.0:
