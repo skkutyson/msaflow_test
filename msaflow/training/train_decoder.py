@@ -44,6 +44,20 @@ from msaflow.utils.alpha_geometry import geometry_ops as _geometry_ops
 logger = logging.getLogger(__name__)
 
 
+def _unwrap_model(model):
+    """Strip DDP/accelerate wrappers to the underlying nn.Module.
+
+    We avoid accelerator.unwrap_model() on purpose: it calls
+    extract_model_from_parallel, which does `from deepspeed import DeepSpeedEngine`
+    just for an isinstance check. On nodes without CUDA_HOME that import crashes
+    (deepspeed probes the CUDA toolchain at import time). We never use deepspeed
+    here (single-GPU / DDP), so peeling `.module` is equivalent and import-free.
+    """
+    while hasattr(model, "module"):
+        model = model.module
+    return model
+
+
 def _tokens_to_strs(tokens: torch.Tensor) -> list:
     """Convert (B, L) integer token tensor to list of amino-acid strings."""
     rows = tokens.cpu().tolist()
@@ -516,7 +530,7 @@ def train(cfg):
             config=OmegaConf.to_container(cfg),
         )
         wandb.watch(
-            accelerator.unwrap_model(model),
+            _unwrap_model(model),
             log="gradients",
             log_freq=cfg.training.log_every,
         )
@@ -608,7 +622,7 @@ def train(cfg):
                     scheduler.step()
                     global_step += 1
                     if ema is not None:
-                        ema.update(accelerator.unwrap_model(model))
+                        ema.update(_unwrap_model(model))
 
             epoch_loss += loss.detach().float()
 
@@ -633,7 +647,7 @@ def train(cfg):
         if val_every > 0 and (epoch + 1) % val_every == 0 and accelerator.is_main_process:
             per_protein = [
                 validate_generation(
-                    accelerator.unwrap_model(model),
+                    _unwrap_model(model),
                     vb,
                     vocab_size=cfg.model.vocab_size,
                     n_steps=cfg.training.get("val_ode_steps", 50),
@@ -669,7 +683,7 @@ def train(cfg):
             n_ex_seqs     = cfg.training.get("val_example_seqs", 5)
             if n_ex_proteins > 0 and val_items:
                 save_val_examples(
-                    accelerator.unwrap_model(model),
+                    _unwrap_model(model),
                     val_items,
                     vocab_size=cfg.model.vocab_size,
                     epoch=epoch,
@@ -685,7 +699,7 @@ def train(cfg):
 
         # ── Checkpoint ───────────────────────────────────────────────────────
         if accelerator.is_main_process:
-            unwrapped = accelerator.unwrap_model(model)
+            unwrapped = _unwrap_model(model)
             ckpt = {
                 "model": unwrapped.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -726,7 +740,7 @@ def train(cfg):
         logger.info("Training complete.")
         if ema is not None:
             # Save EMA weights as the final model
-            unwrapped = accelerator.unwrap_model(model)
+            unwrapped = _unwrap_model(model)
             ema.copy_to(unwrapped)
             torch.save({"model": unwrapped.state_dict(), "alpha": alpha},
                        output_dir / "decoder_ema_final.pt")

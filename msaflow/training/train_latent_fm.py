@@ -29,7 +29,7 @@ from omegaconf import OmegaConf
 
 from msaflow.models.latent_fm import LatentFMEncoder, rectified_flow_loss
 from msaflow.data.dataset import LatentFMDataset, latent_collate_fn
-from msaflow.training.train_decoder import EMA, get_lr_schedule
+from msaflow.training.train_decoder import EMA, get_lr_schedule, _unwrap_model
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ def train(cfg):
             config=OmegaConf.to_container(cfg),
         )
         wandb.watch(
-            accelerator.unwrap_model(model),
+            _unwrap_model(model),
             log="gradients",
             log_freq=cfg.training.log_every,
         )
@@ -177,7 +177,7 @@ def train(cfg):
                     scheduler.step()
                     global_step += 1
                     if ema is not None:
-                        ema.update(accelerator.unwrap_model(model))
+                        ema.update(_unwrap_model(model))
 
             epoch_loss += loss.detach().float()
 
@@ -199,7 +199,7 @@ def train(cfg):
 
         # ── Checkpoint ───────────────────────────────────────────────────────
         if accelerator.is_main_process:
-            unwrapped = accelerator.unwrap_model(model)
+            unwrapped = _unwrap_model(model)
             ckpt = {
                 "model": unwrapped.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -229,7 +229,7 @@ def train(cfg):
     if accelerator.is_main_process:
         logger.info("Training complete.")
         if ema is not None:
-            unwrapped = accelerator.unwrap_model(model)
+            unwrapped = _unwrap_model(model)
             ema.copy_to(unwrapped)
             torch.save({"model": unwrapped.state_dict()}, output_dir / "latent_fm_ema_final.pt")
         if use_wandb:
