@@ -200,6 +200,48 @@ def validate_generation(
     return metrics
 
 
+@torch.no_grad()
+def validate_loss(
+    model: SFMDecoder,
+    val_items: list,
+    vocab_size: int,
+    alpha: float,
+    t_max_eps: float = 0.01,
+    n_draws: int = 8,
+) -> float:
+    """Teacher-forced α-Flow loss on the validation batches (same objective as train).
+
+    flow_loss samples t / x0 / x1 stochastically, so a single call is noisy. We
+    average `n_draws` draws per batch (and across batches, Neff-weighted like the
+    train loss) to get a stable per-epoch scalar comparable to the train curve.
+    Model must already be in eval(); caller restores train() afterwards.
+    """
+    device = next(model.parameters()).device
+    total, count = 0.0, 0
+    for vb in val_items:
+        tokens = vb["tokens"].to(device)
+        msa_emb = vb["msa_emb"].to(device)
+        weights = vb.get("weights")
+        if weights is not None:
+            weights = weights.to(device)
+        seq_lengths = vb.get("seq_lengths")
+        if seq_lengths is not None:
+            seq_lengths = seq_lengths.to(device)
+            pos = torch.arange(tokens.shape[1], device=device).unsqueeze(0)
+            padding_mask = pos < seq_lengths.unsqueeze(1)
+        else:
+            padding_mask = None
+        for _ in range(n_draws):
+            total += flow_loss(
+                model, tokens, msa_emb,
+                vocab_size=vocab_size, alpha=alpha,
+                weights=weights, padding_mask=padding_mask,
+                t_max_eps=t_max_eps,
+            ).item()
+            count += 1
+    return total / max(1, count)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Validation sequence example logger
 # ──────────────────────────────────────────────────────────────────────────────
@@ -673,11 +715,19 @@ def train(cfg):
                     k: float(np.mean([m[k] for m in per_protein]))
                     for k in per_protein[0]
                 }
+                # Teacher-forced flow-matching loss on val — directly comparable
+                # to the train loss curve (same objective, no generation).
+                val_metrics["val/loss"] = validate_loss(
+                    _unwrap_model(model), val_items,
+                    vocab_size=cfg.model.vocab_size, alpha=alpha,
+                    t_max_eps=cfg.training.get("t_max_eps", 0.01),
+                )
                 t05 = "val/t05"
                 logger.info(
-                    "Epoch %d val (%d proteins) | t=0 recovery=%.3f gap=%.3f kl=%.4f"
+                    "Epoch %d val (%d proteins) | loss=%.4f | t=0 recovery=%.3f gap=%.3f kl=%.4f"
                     " | t=0.5 recovery=%.3f gap=%.3f kl=%.4f",
                     epoch, len(val_items),
+                    val_metrics["val/loss"],
                     val_metrics["val/seq_recovery"],
                     val_metrics["val/gap_frac"],
                     val_metrics["val/aa_kl_div"],
