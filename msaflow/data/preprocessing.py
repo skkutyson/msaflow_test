@@ -28,6 +28,7 @@ LMDB schema per entry (pickled dict):
   }
 """
 
+import os
 import sys
 import pickle
 import logging
@@ -513,19 +514,30 @@ def build_lmdb(
         logger.info("Loaded %d a3m paths from %s (delete it to rescan)",
                     len(a3m_files), list_cache)
     else:
-        if a3m_name:
-            # fixed-depth globs first — far cheaper than ** on network storage
-            patterns = [f"*/a3m/{a3m_name}", f"*/{a3m_name}", f"**/{a3m_name}"]
-        else:
-            patterns = ["**/*.a3m"]
         a3m_files = []
-        for pattern in patterns:
-            logger.info("Scanning %s for %s (may take a while on network storage)",
-                        a3m_dir, pattern)
-            a3m_files = sorted(Path(a3m_dir).glob(pattern))
-            if a3m_files:
-                break
-        logger.info("Found %d A3M files total (pattern %s)", len(a3m_files), pattern)
+        if a3m_name:
+            # One readdir of the top level, then construct candidate paths
+            # directly — per-directory stat calls are what make glob/find take
+            # hours on GPFS-scale trees. Missing candidates are skipped (with a
+            # warning) at processing time instead of being stat-checked here.
+            logger.info("Listing top level of %s (single readdir)", a3m_dir)
+            with os.scandir(a3m_dir) as it:
+                names = sorted(e.name for e in it)
+            logger.info("%d top-level entries", len(names))
+            for rel in (("a3m", a3m_name), (a3m_name,)):
+                candidates = [Path(a3m_dir, n, *rel) for n in names]
+                if any(p.is_file() for p in candidates[:50]):
+                    a3m_files = candidates
+                    break
+            if not a3m_files:
+                logger.info("Layout probe failed — falling back to recursive scan "
+                            "(may take a long time on network storage)")
+                a3m_files = sorted(Path(a3m_dir).glob(f"**/{a3m_name}"))
+        else:
+            logger.info("Scanning %s for **/*.a3m (recursive — may take a long "
+                        "time on network storage)", a3m_dir)
+            a3m_files = sorted(Path(a3m_dir).glob("**/*.a3m"))
+        logger.info("Found %d A3M files total", len(a3m_files))
         if a3m_files:
             with open(list_cache, "w") as f:
                 f.writelines(f"{p}\n" for p in a3m_files)
