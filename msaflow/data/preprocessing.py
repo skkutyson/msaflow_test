@@ -419,6 +419,26 @@ def extract_esm_embedding(
 # Main LMDB building routine
 # ──────────────────────────────────────────────────────────────────────────────
 
+# A3M filenames that identify the source database rather than the protein.
+# OpenProteinSet/OpenFold layouts nest these under a per-protein directory
+# ({uniprot_id}/a3m/uniclust30.a3m or {pdb}_{chain}/uniclust30_hits.a3m), so
+# the LMDB key must come from the directory name, not the file stem.
+_DB_A3M_STEMS = {
+    "uniclust30", "uniclust30_hits", "bfd_uniclust_hits",
+    "mgnify_hits", "uniref90_hits", "uniprot_hits",
+}
+
+
+def _a3m_key(path: Path) -> str:
+    """Derive the LMDB key for an a3m file (flat or OpenProteinSet layout)."""
+    if path.stem not in _DB_A3M_STEMS:
+        return path.stem  # flat layout: {pdb_id}__{chain_id}.a3m
+    parent = path.parent
+    if parent.name == "a3m":
+        parent = parent.parent
+    return parent.name
+
+
 def build_lmdb(
     a3m_dir: str,
     output_path: str,
@@ -429,6 +449,8 @@ def build_lmdb(
     map_size_gb: int = 500,
     protein_list: Optional[str] = None,
     n_cycle: int = 3,
+    a3m_name: Optional[str] = None,
+    resume: bool = False,
 ):
     """
     Process all A3M files in a3m_dir and write LMDB database.
@@ -444,6 +466,10 @@ def build_lmdb(
         protein_list:         Optional path to a text file with one protein ID per line.
                               When provided, only those proteins are processed.
         n_cycle:              Protenix recycling cycles for MSA embedding extraction.
+        a3m_name:             Exact a3m filename to process (e.g. "uniclust30.a3m").
+                              Required for OpenProteinSet-style trees where each
+                              protein dir holds several db a3ms; None = every .a3m.
+        resume:               Skip proteins whose key already exists in the LMDB.
     """
     logger.info("build_lmdb started")
     logger.info("  a3m_dir    : %s", a3m_dir)
@@ -451,6 +477,7 @@ def build_lmdb(
     logger.info("  max_seq_len: %d  max_msa_seqs: %d", max_seq_len, max_msa_seqs)
     logger.info("  device     : %s  map_size: %dGB", device, map_size_gb)
     logger.info("  protenix   : %s  n_cycle: %d", protenix_checkpoint or "disabled", n_cycle)
+    logger.info("  a3m_name   : %s  resume: %s", a3m_name or "*.a3m", resume)
 
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
 
@@ -472,8 +499,9 @@ def build_lmdb(
     else:
         logger.info("ESM2 loaded  (CPU mode)")
 
-    a3m_files = list(Path(a3m_dir).glob("**/*.a3m"))
-    logger.info("Found %d A3M files total", len(a3m_files))
+    pattern = f"**/{a3m_name}" if a3m_name else "**/*.a3m"
+    a3m_files = sorted(Path(a3m_dir).glob(pattern))
+    logger.info("Found %d A3M files total (pattern %s)", len(a3m_files), pattern)
 
     if protein_list is not None:
         if not Path(protein_list).is_file():
@@ -484,13 +512,21 @@ def build_lmdb(
             )
         with open(protein_list) as f:
             allowed_ids = {line.strip() for line in f if line.strip()}
-        a3m_files = [p for p in a3m_files if p.stem in allowed_ids]
+        a3m_files = [p for p in a3m_files if _a3m_key(p) in allowed_ids]
         logger.info("Filtered to %d A3M files from protein_list (%s)",
                     len(a3m_files), protein_list)
         if not a3m_files:
             logger.warning("protein_list %s matched 0 of the a3m files in %s "
-                           "(check IDs match a3m filenames without .a3m)",
+                           "(check IDs match the derived LMDB keys)",
                            protein_list, a3m_dir)
+
+    n_keys = len({_a3m_key(p) for p in a3m_files})
+    if n_keys < len(a3m_files):
+        logger.warning(
+            "%d a3m files map to only %d distinct keys — later files overwrite "
+            "earlier ones. Pass --a3m_name (e.g. uniclust30.a3m) to pick one db "
+            "per protein.", len(a3m_files), n_keys,
+        )
 
     env = lmdb.open(
         output_path,
@@ -500,10 +536,18 @@ def build_lmdb(
         map_async=True,
     )
 
+    if resume:
+        with env.begin() as txn:
+            existing = {k.decode() for k, _ in txn.cursor()}
+        n_before = len(a3m_files)
+        a3m_files = [p for p in a3m_files if _a3m_key(p) not in existing]
+        logger.info("Resume: %d keys already in LMDB, %d a3m files remaining",
+                    n_before - len(a3m_files), len(a3m_files))
+
     stats = PreprocessStats(n_total=len(a3m_files))
 
     for file_idx, a3m_path in enumerate(tqdm(a3m_files, desc="Building LMDB")):
-        key = a3m_path.stem  # {pdb_id}__{chain_id}
+        key = _a3m_key(a3m_path)
         try:
             # ── Parse ────────────────────────────────────────────────────────
             _names, seqs = parse_a3m(str(a3m_path))
@@ -613,6 +657,11 @@ if __name__ == "__main__":
                         help="Text file with one protein ID per line to process (optional)")
     parser.add_argument("--n_cycle",              type=int, default=3,
                         help="Protenix recycling cycles (3 = MSAFlow default)")
+    parser.add_argument("--a3m_name",             default=None,
+                        help="Exact a3m filename to process (e.g. uniclust30.a3m); "
+                             "default processes every .a3m under --a3m_dir")
+    parser.add_argument("--resume",               action="store_true",
+                        help="Skip proteins whose key already exists in the LMDB")
     args = parser.parse_args()
 
     build_lmdb(
@@ -625,4 +674,6 @@ if __name__ == "__main__":
         map_size_gb=args.map_size_gb,
         protein_list=args.protein_list,
         n_cycle=args.n_cycle,
+        a3m_name=args.a3m_name,
+        resume=args.resume,
     )

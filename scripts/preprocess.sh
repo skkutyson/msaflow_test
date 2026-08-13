@@ -2,7 +2,7 @@
 #SBATCH --job-name=msaflow-preprocess
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:RTX6000:1
+#SBATCH --gres=gpu:RTX4090:1
 #SBATCH --cpus-per-task=16
 #SBATCH --time=48:00:00
 #SBATCH --partition=normal
@@ -14,7 +14,14 @@ REPO_DIR=/home/yjlee4/MSA_FLOW
 SANDBOX=/home/yjlee4/msaflow_sandbox
 
 A3M_DIR=${A3M_DIR:-/gpfs/database/openfold/uniclust30}
-OUTPUT_LMDB=${OUTPUT_LMDB:-/gpfs/deepfold/users/yjlee4/msaflow.lmdb}
+OUTPUT_LMDB=${OUTPUT_LMDB:-/gpfs/deepfold/users/yjlee4/msaflow_openfold.lmdb}
+
+# OpenProteinSet 레이아웃({ID}/a3m/uniclust30.a3m)에서는 protein당 db a3m이
+# 여러 개일 수 있어 하나만 골라야 함. 빈 문자열이면 모든 *.a3m 처리.
+A3M_NAME=${A3M_NAME:-uniclust30.a3m}
+
+# RESUME=1 이면 LMDB에 이미 있는 key는 건너뜀 (48h 안에 못 끝나면 재제출)
+RESUME=${RESUME:-1}
 
 # 체크포인트는 repo 안에 있으므로 컨테이너 내부 경로로 바로 지정
 PROTENIX_CKPT_CONTAINER=/mnt/MSA_FLOW/checkpoints/checkpoints/protenix_base_default_v1.0.0.pt
@@ -53,6 +60,7 @@ echo " A3M_DIR     : $A3M_DIR"
 echo " OUTPUT_LMDB : $OUTPUT_LMDB"
 echo " PROTENIX    : $PROTENIX_CKPT_CONTAINER (inside container)"
 echo " CCD_DIR     : $CCD_DIR"
+echo " A3M_NAME    : ${A3M_NAME:-<all *.a3m>}  |  RESUME: $RESUME"
 echo " MAX_MSA     : $MAX_MSA_SEQS  |  MAX_LEN: $MAX_SEQ_LEN  |  N_CYCLE: $N_CYCLE"
 echo " Started     : $(date)"
 echo "============================================================"
@@ -65,19 +73,23 @@ echo "============================================================"
 #   /mnt/protenix_root/common → CCD_DIR (PROTENIX_ROOT_DIR env로 지정; $HOME bind에
 #                             의존하지 않도록 명시적으로 바인드)
 
+EXTRA_ARGS=""
+[ -n "$A3M_NAME" ] && EXTRA_ARGS="$EXTRA_ARGS --a3m_name $A3M_NAME"
+[ "$RESUME" = "1" ] && EXTRA_ARGS="$EXTRA_ARGS --resume"
+
 apptainer exec --nv \
     --bind "$REPO_DIR":/mnt/MSA_FLOW \
     --bind "$A3M_DIR":/mnt/data \
     --bind "$(dirname "$OUTPUT_LMDB")":/mnt/output \
     --bind "$CCD_DIR":/mnt/protenix_root/common \
     --env PROTENIX_ROOT_DIR=/mnt/protenix_root \
+    --env TORCH_CUDA_ARCH_LIST="8.9;12.0" \
+    --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     "$SANDBOX" \
     bash -c "
         set -euo pipefail
         cd /mnt/MSA_FLOW
 
-        TORCH_CUDA_ARCH_LIST="12.0" \
-        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         uv run python3 -m msaflow.data.preprocessing \
             --a3m_dir      /mnt/data \
             --output       /mnt/output/$(basename "$OUTPUT_LMDB") \
@@ -86,7 +98,8 @@ apptainer exec --nv \
             --max_seq_len  $MAX_SEQ_LEN \
             --device       cuda \
             --map_size_gb  $MAP_SIZE_GB \
-            --n_cycle      $N_CYCLE
+            --n_cycle      $N_CYCLE \
+            $EXTRA_ARGS
     "
 
 echo "============================================================"
