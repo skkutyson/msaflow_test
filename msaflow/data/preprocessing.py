@@ -451,6 +451,7 @@ def build_lmdb(
     n_cycle: int = 3,
     a3m_name: Optional[str] = None,
     resume: bool = False,
+    a3m_list: Optional[str] = None,
 ):
     """
     Process all A3M files in a3m_dir and write LMDB database.
@@ -470,6 +471,9 @@ def build_lmdb(
                               Required for OpenProteinSet-style trees where each
                               protein dir holds several db a3ms; None = every .a3m.
         resume:               Skip proteins whose key already exists in the LMDB.
+        a3m_list:             Text file with one a3m path per line. Skips the
+                              directory scan; defaults to the auto-written cache
+                              at <output>.a3m_list.txt when that exists.
     """
     logger.info("build_lmdb started")
     logger.info("  a3m_dir    : %s", a3m_dir)
@@ -499,9 +503,33 @@ def build_lmdb(
     else:
         logger.info("ESM2 loaded  (CPU mode)")
 
-    pattern = f"**/{a3m_name}" if a3m_name else "**/*.a3m"
-    a3m_files = sorted(Path(a3m_dir).glob(pattern))
-    logger.info("Found %d A3M files total (pattern %s)", len(a3m_files), pattern)
+    # Scanning a large tree (OpenProteinSet on GPFS: 100k+ dirs) can take tens
+    # of minutes, so the file list is cached next to the LMDB and reused on
+    # restarts. Pass --a3m_list to use a precomputed list (e.g. from `find`).
+    list_cache = Path(a3m_list) if a3m_list else Path(f"{output_path}.a3m_list.txt")
+    if list_cache.is_file():
+        with open(list_cache) as f:
+            a3m_files = [Path(line.strip()) for line in f if line.strip()]
+        logger.info("Loaded %d a3m paths from %s (delete it to rescan)",
+                    len(a3m_files), list_cache)
+    else:
+        if a3m_name:
+            # fixed-depth globs first — far cheaper than ** on network storage
+            patterns = [f"*/a3m/{a3m_name}", f"*/{a3m_name}", f"**/{a3m_name}"]
+        else:
+            patterns = ["**/*.a3m"]
+        a3m_files = []
+        for pattern in patterns:
+            logger.info("Scanning %s for %s (may take a while on network storage)",
+                        a3m_dir, pattern)
+            a3m_files = sorted(Path(a3m_dir).glob(pattern))
+            if a3m_files:
+                break
+        logger.info("Found %d A3M files total (pattern %s)", len(a3m_files), pattern)
+        if a3m_files:
+            with open(list_cache, "w") as f:
+                f.writelines(f"{p}\n" for p in a3m_files)
+            logger.info("Cached file list to %s", list_cache)
 
     if protein_list is not None:
         if not Path(protein_list).is_file():
@@ -662,6 +690,9 @@ if __name__ == "__main__":
                              "default processes every .a3m under --a3m_dir")
     parser.add_argument("--resume",               action="store_true",
                         help="Skip proteins whose key already exists in the LMDB")
+    parser.add_argument("--a3m_list",             default=None,
+                        help="Text file with one a3m path per line (skips the "
+                             "directory scan; auto-cached at <output>.a3m_list.txt)")
     args = parser.parse_args()
 
     build_lmdb(
@@ -676,4 +707,5 @@ if __name__ == "__main__":
         n_cycle=args.n_cycle,
         a3m_name=args.a3m_name,
         resume=args.resume,
+        a3m_list=args.a3m_list,
     )

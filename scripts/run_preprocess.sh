@@ -19,6 +19,8 @@
 #   A3M_DIR        (required, or pass as arg 1) a3m root directory
 #   OUTPUT_LMDB    output LMDB path            (default: $HOME/data/msaflow_openfold.lmdb)
 #   A3M_NAME       exact a3m filename to use   (default: uniclust30.a3m; ""=every .a3m)
+#   A3M_LIST       txt with one a3m path/line  (skips the slow dir scan; the scan
+#                  result is auto-cached at <OUTPUT_LMDB>.a3m_list.txt anyway)
 #   RESUME         1=skip keys already in LMDB (default: 1)
 #   PROTEIN_LIST   optional txt, one ID per line, to restrict targets
 #   PROTENIX_CKPT  Protenix checkpoint .pt     (default: <repo>/checkpoints/...)
@@ -43,6 +45,7 @@ if [ -z "$A3M_DIR" ]; then
 fi
 OUTPUT_LMDB="${OUTPUT_LMDB:-$HOME/data/msaflow_openfold.lmdb}"
 A3M_NAME="${A3M_NAME-uniclust30.a3m}"
+A3M_LIST="${A3M_LIST:-}"
 RESUME="${RESUME:-1}"
 PROTEIN_LIST="${PROTEIN_LIST:-}"
 PROTENIX_CKPT="${PROTENIX_CKPT:-$REPO_DIR/checkpoints/checkpoints/protenix_base_default_v1.0.0.pt}"
@@ -68,6 +71,7 @@ for f in components.cif components.cif.rdkit_mol.pkl; do
         echo "  download: wget -c https://protenix.tos-cn-beijing.volces.com/common/$f -P $CCD_DIR"; exit 1; }
 done
 [ -z "$PROTEIN_LIST" ] || [ -f "$PROTEIN_LIST" ] || { echo "ERROR: protein list not found: $PROTEIN_LIST"; exit 1; }
+[ -z "$A3M_LIST" ] || [ -f "$A3M_LIST" ] || { echo "ERROR: a3m list not found: $A3M_LIST"; exit 1; }
 command -v uv >/dev/null || { echo "ERROR: uv not found (run scripts/setup_native_uv.sh first)"; exit 1; }
 
 mkdir -p "$(dirname "$OUTPUT_LMDB")"
@@ -94,6 +98,7 @@ uv run python -m msaflow.data.preprocessing \
     --map_size_gb "$MAP_SIZE_GB" \
     --n_cycle "$N_CYCLE" \
     ${A3M_NAME:+--a3m_name "$A3M_NAME"} \
+    ${A3M_LIST:+--a3m_list "$A3M_LIST"} \
     ${PROTEIN_LIST:+--protein_list "$PROTEIN_LIST"} \
     $([ "$RESUME" = "1" ] && echo --resume)
 
