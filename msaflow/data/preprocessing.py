@@ -530,9 +530,17 @@ def build_lmdb(
                     a3m_files = candidates
                     break
             if not a3m_files:
-                logger.info("Layout probe failed — falling back to recursive scan "
-                            "(may take a long time on network storage)")
-                a3m_files = sorted(Path(a3m_dir).glob(f"**/{a3m_name}"))
+                # No recursive-glob fallback: a silent full-tree walk over a
+                # GPFS-scale store is a metadata storm we never want to run
+                # implicitly. Fail loudly instead.
+                raise RuntimeError(
+                    f"Neither {{ID}}/a3m/{a3m_name} nor {{ID}}/{a3m_name} found "
+                    f"under the first 50 of {len(names)} entries in {a3m_dir}. "
+                    f"Refusing to fall back to a recursive scan. Check --a3m_dir "
+                    f"and --a3m_name, or build the list yourself and pass it via "
+                    f"--a3m_list (e.g. `find {a3m_dir} -name {a3m_name} > list.txt` "
+                    f"run at a time/place the storage admins are OK with)."
+                )
         else:
             logger.info("Scanning %s for **/*.a3m (recursive — may take a long "
                         "time on network storage)", a3m_dir)
