@@ -17,14 +17,14 @@ import argparse
 import csv
 import logging
 import os
-import pickle
 import shutil
 import time
 import urllib.request
 from pathlib import Path
 
-import lmdb
 import numpy as np
+
+from msaflow.data.shard_store import ShardStore
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +81,8 @@ def main():
                         help="Output of find_low_msa.sh (TSV with protein_id, n_msa, seq_len)")
     parser.add_argument("--csv",             required=True,
                         help="monomer_protein.csv (pdb_id, chain_id)")
-    parser.add_argument("--lmdb_path",       required=True,
-                        help="LMDB with msa_tokens / query_seq per protein")
+    parser.add_argument("--store_path",      required=True,
+                        help="ShardStore with msa_tokens per protein")
     parser.add_argument("--a3m_dir",         required=True,
                         help="Directory with *.a3m files (one per protein)")
     parser.add_argument("--output_fasta",    required=True,
@@ -107,9 +107,8 @@ def main():
 
     orphan_set = set(orphan_ids)
 
-    # ── Open LMDB ──────────────────────────────────────────────────────────────
-    env = lmdb.open(args.lmdb_path, readonly=True, lock=False, subdir=False,
-                    map_size=500 * 1024 ** 3)
+    # ── Open store ─────────────────────────────────────────────────────────────
+    store = ShardStore(args.store_path)
 
     # ── Process each orphan ────────────────────────────────────────────────────
     fasta_entries = []
@@ -117,27 +116,21 @@ def main():
     shallow_dir = Path(args.shallow_msa_dir)
     ref_dir = Path(args.ref_pdb_dir)
 
-    missing_lmdb = []
+    missing_store = []
     missing_a3m  = []
 
     for protein_id in orphan_ids:
         logger.info("Processing %s", protein_id)
 
-        # ── Get query sequence from LMDB ───────────────────────────────────────
-        with env.begin() as txn:
-            val = txn.get(protein_id.encode())
-
-        if val is None:
-            logger.warning("  NOT in LMDB: %s", protein_id)
-            missing_lmdb.append(protein_id)
+        # ── Get query sequence from the store ──────────────────────────────────
+        if protein_id not in store:
+            logger.warning("  NOT in store: %s", protein_id)
+            missing_store.append(protein_id)
             continue
 
-        data = pickle.loads(val)
-        query_seq = data.get("query_seq")
-        if query_seq is None:
-            # Fall back: decode first row of msa_tokens
-            tokens = data["msa_tokens"][0]
-            query_seq = tokens_to_seq(np.array(tokens))
+        data = store.get(protein_id)
+        # The store does not keep query_seq; recover it from the first MSA row.
+        query_seq = tokens_to_seq(np.array(data["msa_tokens"][0]))
         query_seq = query_seq.replace("-", "")
         fasta_entries.append((protein_id, query_seq))
 
@@ -169,8 +162,6 @@ def main():
                 logger.warning("  Reference CIF unavailable for %s (pdb: %s)", protein_id, raw_pdb)
             time.sleep(0.1)   # be polite to RCSB
 
-    env.close()
-
     # ── Write FASTA ────────────────────────────────────────────────────────────
     with open(args.output_fasta, "w") as fh:
         for name, seq in fasta_entries:
@@ -182,7 +173,7 @@ def main():
     print(f"Orphan data preparation complete")
     print(f"  Total orphans        : {len(orphan_ids)}")
     print(f"  FASTA written        : {len(fasta_entries)}")
-    print(f"  Missing from LMDB    : {len(missing_lmdb)}")
+    print(f"  Missing from store   : {len(missing_store)}")
     print(f"  Missing a3m (depth-1): {len(missing_a3m)}")
     ref_count = sum(1 for p in orphan_ids
                     if (ref_dir / f"{p}.cif").exists())
@@ -192,9 +183,9 @@ def main():
     print(f"  Ref PDB dir          : {args.ref_pdb_dir}")
     print("=" * 60)
 
-    if missing_lmdb:
+    if missing_store:
         print("\nProteins not found in LMDB (excluded from benchmark):")
-        for pid in missing_lmdb:
+        for pid in missing_store:
             print(f"  {pid}")
     if missing_a3m:
         print("\nProteins with missing a3m (using depth-1 fallback):")

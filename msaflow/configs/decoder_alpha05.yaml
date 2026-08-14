@@ -14,8 +14,8 @@ model:
                          # α defaults to 0.0 (L² sphere = SFM) when omitted.
 
 data:
-  lmdb_path: /gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb
-  val_lmdb_path: /gpfs/deepfold/users/yjlee4/msaflow_fold.lmdb
+  store_path: /gpfs/deepfold/users/yjlee4/msaflow_merged
+  val_store_path: /gpfs/deepfold/users/yjlee4/msaflow_fold
   n_seqs_per_msa: 32
   max_seq_len: 1024
   batch_size: 1           # DDP/autocast fix restores bf16 → can try raising to 4

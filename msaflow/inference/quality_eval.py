@@ -26,7 +26,7 @@ Metrics:
 Usage:
     # Step 1 — test SFM decoder with ground-truth msa_emb:
     python msaflow/inference/quality_eval.py \\
-        --lmdb_path /gpfs/.../msaflow_merged.lmdb \\
+        --store_path /gpfs/.../msaflow_openfold \\
         --decoder_ckpt  runs/decoder/decoder_ema_final.pt \\
         --latent_fm_ckpt runs/latent_fm/latent_fm_ema_final.pt \\
         --mode reconstruct --n_proteins 20 --verbose
@@ -38,7 +38,6 @@ Usage:
 import argparse
 import csv
 import logging
-import pickle
 import random
 import sys
 from pathlib import Path
@@ -130,43 +129,34 @@ def seqs_to_tokens(seqs: list[str]) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LMDB sampling
+# Store sampling
 # ─────────────────────────────────────────────────────────────────────────────
 
-def sample_lmdb_entries(
-    lmdb_path: str,
+def sample_store_entries(
+    store_path: str,
     n: int,
     seed: int = 42,
     require_esm: bool = False,
     require_msa_emb: bool = False,
 ) -> list[dict]:
-    import lmdb as lmdb_lib
-    env = lmdb_lib.open(lmdb_path, readonly=True, lock=False,
-                        readahead=False, meminit=False, subdir=False)
-    with env.begin() as txn:
-        all_keys = [k.decode() for k in txn.cursor().iternext(keys=True, values=False)]
+    from msaflow.data.shard_store import ShardStore
+    store = ShardStore(store_path)
+    all_keys = store.keys()
 
-    logger.info("LMDB: %d entries total, sampling up to %d ...", len(all_keys), n)
+    logger.info("Store: %d entries total, sampling up to %d ...", len(all_keys), n)
     rng          = random.Random(seed)
     sampled_keys = rng.sample(all_keys, min(n * 5, len(all_keys)))
 
+    # Every store entry carries both msa_emb and esm_emb, so require_* are always
+    # satisfied; kept in the signature for call-site compatibility.
     entries = []
-    with env.begin() as txn:
-        for key in sampled_keys:
-            if len(entries) >= n:
-                break
-            raw = txn.get(key.encode())
-            if raw is None:
-                continue
-            entry = pickle.loads(raw)
-            if require_esm     and entry.get("esm_emb")  is None:
-                continue
-            if require_msa_emb and entry.get("msa_emb")  is None:
-                continue
-            entry["_key"] = key
-            entries.append(entry)
+    for key in sampled_keys:
+        if len(entries) >= n:
+            break
+        entry = store.get(key)
+        entry["_key"] = key
+        entries.append(entry)
 
-    env.close()
     logger.info("Loaded %d entries", len(entries))
     return entries
 
@@ -205,8 +195,8 @@ def run_quality_eval(args):
         latent_fm = load_latent_fm(args.latent_fm_ckpt, device)
     logger.info("Models loaded.")
 
-    entries = sample_lmdb_entries(
-        lmdb_path=args.lmdb_path,
+    entries = sample_store_entries(
+        store_path=args.store_path,
         n=args.n_proteins,
         seed=args.seed,
         require_esm=    (not is_reconstruct),
@@ -214,7 +204,7 @@ def run_quality_eval(args):
     )
 
     if not entries:
-        logger.error("No entries found — check lmdb_path / require_msa_emb setting.")
+        logger.error("No entries found — check store_path.")
         return
 
     results = []
@@ -376,7 +366,8 @@ def run_quality_eval(args):
 
 def main():
     parser = argparse.ArgumentParser(description="MSAFlow MSA quality evaluation")
-    parser.add_argument("--lmdb_path",       required=True)
+    parser.add_argument("--store_path",      required=True,
+                        help="Path to the ShardStore directory")
     parser.add_argument("--decoder_ckpt",    required=True)
     parser.add_argument("--latent_fm_ckpt",  required=True)
     parser.add_argument("--mode",            default="reconstruct",

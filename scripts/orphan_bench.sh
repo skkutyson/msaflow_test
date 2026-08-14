@@ -39,7 +39,7 @@ SANDBOX=/home/yjlee4/msaflow_sandbox
 ORPHAN_LIST=${ORPHAN_LIST:-$(ls -t "$REPO_DIR/logs/find_low_msa_"*.out 2>/dev/null | head -1)}
 
 A3M_DIR=${A3M_DIR:-/store/deepfold3/results/msa/a3m}
-LMDB_PATH=${LMDB_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_fold.lmdb}
+STORE_PATH=${STORE_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_fold}
 
 DECODER_CKPT=${DECODER_CKPT:-/gpfs/deepfold/users/yjlee4/decoder/decoder_ema_final.pt}
 LATENT_FM_CKPT=${LATENT_FM_CKPT:-/home/yjlee4/data/runs/latent_fm/latent_fm_ema_final.pt}
@@ -87,7 +87,7 @@ apptainer exec \
     --bind "$REPO_DIR":/mnt/MSA_FLOW \
     --bind "$A3M_DIR":/mnt/a3m \
     --bind "$PREP_DIR":/mnt/prep \
-    --bind "$(dirname "$LMDB_PATH")":/mnt/lmdb \
+    --bind "$(dirname "$STORE_PATH")":/mnt/store \
     "$SANDBOX" \
     bash -c "
         set -euo pipefail
@@ -96,7 +96,7 @@ apptainer exec \
         uv run python3 scripts/prep_orphan_data.py \
             --orphan_list    '/mnt/MSA_FLOW/logs/$(basename "$ORPHAN_LIST")' \
             --csv            /mnt/MSA_FLOW/monomer_protein.csv \
-            --lmdb_path      /mnt/lmdb/$(basename "$LMDB_PATH") \
+            --store_path     /mnt/store/$(basename "$STORE_PATH") \
             --a3m_dir        /mnt/a3m \
             --output_fasta   /mnt/prep/orphan_proteins.fasta \
             --shallow_msa_dir /mnt/prep/shallow_msas \

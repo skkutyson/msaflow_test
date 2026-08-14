@@ -14,7 +14,7 @@
 REPO_DIR=/home/yjlee4/MSA_FLOW
 SANDBOX=/home/yjlee4/msaflow_sandbox
 
-LMDB_PATH=${LMDB_PATH:-/home/yjlee4/data/msaflow.lmdb}
+STORE_PATH=${STORE_PATH:-/home/yjlee4/data/msaflow_openfold}
 OUTPUT_DIR=${OUTPUT_DIR:-/home/yjlee4/data/runs/latent_fm}
 
 CONFIG=/mnt/MSA_FLOW/msaflow/configs/latent_fm.yaml
@@ -29,7 +29,7 @@ echo "============================================================"
 echo " Job ID      : $SLURM_JOB_ID"
 echo " Node        : $SLURMD_NODENAME"
 echo " GPUs        : $CUDA_VISIBLE_DEVICES"
-echo " LMDB        : $LMDB_PATH"
+echo " STORE       : $STORE_PATH"
 echo " OUTPUT_DIR  : $OUTPUT_DIR"
 echo " Started     : $(date)"
 echo "============================================================"
@@ -55,7 +55,7 @@ apptainer exec --nv \
     --env WANDB_API_KEY="$WANDB_API_KEY" \
     --env WANDB_MODE="${WANDB_MODE:-online}" \
     --bind "$REPO_DIR":/mnt/MSA_FLOW \
-    --bind "$(dirname "$LMDB_PATH")":/mnt/lmdb \
+    --bind "$(dirname "$STORE_PATH")":/mnt/store \
     --bind "$OUTPUT_DIR":/mnt/output \
     "$SANDBOX" \
     bash -c "
@@ -66,7 +66,7 @@ apptainer exec --nv \
             --config_file $ACCEL_CONFIG \
             msaflow/training/train_latent_fm.py \
             --config      $CONFIG \
-            --lmdb_path   /mnt/lmdb/$(basename "$LMDB_PATH") \
+            --store_path  /mnt/store/$(basename "$STORE_PATH") \
             --output_dir  /mnt/output
     "
 

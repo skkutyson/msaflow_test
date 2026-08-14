@@ -16,7 +16,7 @@ module load python/3.11.14
 export PATH="$HOME/.local/bin:$PATH"
 
 REPO_DIR=${REPO_DIR:-/home/paul3875/projects/MSA_FLOW}
-LMDB_PATH=${LMDB_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb}
+STORE_PATH=${STORE_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_merged}
 DECODER_CKPT=${DECODER_CKPT:-$REPO_DIR/runs/decoder/decoder_ema_final.pt}
 LATENT_FM_CKPT=${LATENT_FM_CKPT:-$REPO_DIR/runs/latent_fm/latent_fm_ema_final.pt}
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO_DIR/runs/quality_eval}
@@ -37,7 +37,7 @@ mkdir -p $OUTPUT_DIR $REPO_DIR/logs
 
 echo "Job ID         : $SLURM_JOB_ID"
 echo "Node           : $SLURMD_NODENAME"
-echo "LMDB           : $LMDB_PATH"
+echo "STORE          : $STORE_PATH"
 echo "Decoder ckpt   : $DECODER_CKPT"
 echo "Latent FM ckpt : $LATENT_FM_CKPT"
 echo "Mode           : $MODE"
@@ -47,7 +47,7 @@ echo "ODE steps      : $N_STEPS"
 date
 
 python $REPO_DIR/msaflow/inference/quality_eval.py \
-    --lmdb_path      $LMDB_PATH \
+    --store_path     $STORE_PATH \
     --decoder_ckpt   $DECODER_CKPT \
     --latent_fm_ckpt $LATENT_FM_CKPT \
     --mode           $MODE \

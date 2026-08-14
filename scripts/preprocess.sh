@@ -14,13 +14,13 @@ REPO_DIR=/home/yjlee4/MSA_FLOW
 SANDBOX=/home/yjlee4/msaflow_sandbox
 
 A3M_DIR=${A3M_DIR:-/gpfs/database/openfold/uniclust30}
-OUTPUT_LMDB=${OUTPUT_LMDB:-/gpfs/deepfold/users/yjlee4/msaflow_openfold.lmdb}
+OUTPUT_STORE=${OUTPUT_STORE:-/gpfs/deepfold/users/yjlee4/msaflow_openfold}
 
 # OpenProteinSet 레이아웃({ID}/a3m/uniclust30.a3m)에서는 protein당 db a3m이
 # 여러 개일 수 있어 하나만 골라야 함. 빈 문자열이면 모든 *.a3m 처리.
 A3M_NAME=${A3M_NAME:-uniclust30.a3m}
 
-# RESUME=1 이면 LMDB에 이미 있는 key는 건너뜀 (48h 안에 못 끝나면 재제출)
+# RESUME=1 이면 store에 이미 있는 id는 건너뜀 (48h 안에 못 끝나면 재제출)
 RESUME=${RESUME:-1}
 
 # 체크포인트는 repo 안에 있으므로 컨테이너 내부 경로로 바로 지정
@@ -33,7 +33,7 @@ CCD_DIR=${CCD_DIR:-$HOME/common}
 
 MAX_MSA_SEQS=${MAX_MSA_SEQS:-512}
 MAX_SEQ_LEN=${MAX_SEQ_LEN:-1024}
-MAP_SIZE_GB=${MAP_SIZE_GB:-500}
+SHARD_MAX_GB=${SHARD_MAX_GB:-4}
 N_CYCLE=${N_CYCLE:-3}           # Protenix recycling cycles (MSAFlow 기본값)
 
 # ── CCD 파일 사전 검증 ─────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ for f in components.cif components.cif.rdkit_mol.pkl; do
 done
 
 # ── 로그 디렉터리 생성 ─────────────────────────────────────────────────────────
-mkdir -p "$REPO_DIR/logs" "$(dirname "$OUTPUT_LMDB")"
+mkdir -p "$REPO_DIR/logs" "$(dirname "$OUTPUT_STORE")"
 
 echo "============================================================"
 echo " MSAFlow Preprocessing (SLURM + Apptainer)"
@@ -57,7 +57,7 @@ echo " GPUs        : $CUDA_VISIBLE_DEVICES"
 echo " REPO_DIR    : $REPO_DIR"
 echo " SANDBOX     : $SANDBOX"
 echo " A3M_DIR     : $A3M_DIR"
-echo " OUTPUT_LMDB : $OUTPUT_LMDB"
+echo " OUTPUT_STORE: $OUTPUT_STORE"
 echo " PROTENIX    : $PROTENIX_CKPT_CONTAINER (inside container)"
 echo " CCD_DIR     : $CCD_DIR"
 echo " A3M_NAME    : ${A3M_NAME:-<all *.a3m>}  |  RESUME: $RESUME"
@@ -69,7 +69,7 @@ echo "============================================================"
 # bind 구성:
 #   /mnt/MSA_FLOW           → REPO_DIR (msaflow 패키지 + checkpoint + Protenix/esm 서브모듈)
 #   /mnt/data               → A3M 파일 디렉터리
-#   /mnt/output             → OUTPUT_LMDB 상위 디렉터리
+#   /mnt/output             → OUTPUT_STORE 상위 디렉터리
 #   /mnt/protenix_root/common → CCD_DIR (PROTENIX_ROOT_DIR env로 지정; $HOME bind에
 #                             의존하지 않도록 명시적으로 바인드)
 
@@ -80,7 +80,7 @@ EXTRA_ARGS=""
 apptainer exec --nv \
     --bind "$REPO_DIR":/mnt/MSA_FLOW \
     --bind "$A3M_DIR":/mnt/data \
-    --bind "$(dirname "$OUTPUT_LMDB")":/mnt/output \
+    --bind "$(dirname "$OUTPUT_STORE")":/mnt/output \
     --bind "$CCD_DIR":/mnt/protenix_root/common \
     --env PROTENIX_ROOT_DIR=/mnt/protenix_root \
     --env TORCH_CUDA_ARCH_LIST="8.9;12.0" \
@@ -92,12 +92,12 @@ apptainer exec --nv \
 
         uv run python3 -m msaflow.data.preprocessing \
             --a3m_dir      /mnt/data \
-            --output       /mnt/output/$(basename "$OUTPUT_LMDB") \
+            --output       /mnt/output/$(basename "$OUTPUT_STORE") \
             --protenix_checkpoint $PROTENIX_CKPT_CONTAINER \
             --max_msa_seqs $MAX_MSA_SEQS \
             --max_seq_len  $MAX_SEQ_LEN \
             --device       cuda \
-            --map_size_gb  $MAP_SIZE_GB \
+            --shard_max_gb $SHARD_MAX_GB \
             --n_cycle      $N_CYCLE \
             $EXTRA_ARGS
     "

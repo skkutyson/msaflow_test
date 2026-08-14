@@ -1,8 +1,9 @@
 """
-Scan msaflow_merged.lmdb and report the Neff score distribution.
+Scan a MSAFlow ShardStore and report the Neff score distribution.
 
-Neff per entry = weights.sum()  (weights are Neff-reweighting scores stored
-by preprocessing.build_lmdb; see compute_sequence_weights in preprocessing.py)
+Neff per entry = weights.sum(), precomputed into the `neff` column of the
+store's index.parquet (see compute_sequence_weights in preprocessing.py), so
+this reads only the index — no embedding shards are touched.
 
 Outputs
 -------
@@ -12,9 +13,7 @@ Outputs
 """
 
 import argparse
-import pickle
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -55,59 +54,30 @@ def ascii_histogram(values: np.ndarray, n_bins: int = 40, bar_width: int = 50) -
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lmdb_path", required=True)
+    parser.add_argument("--store_path", required=True,
+                        help="Path to the ShardStore directory")
     parser.add_argument("--output_dir", default=".")
     parser.add_argument("--sample_every", type=int, default=1,
-                        help="Read every Nth entry (1 = all, 10 = 10%% sample)")
+                        help="Keep every Nth entry (1 = all, 10 = 10%% sample)")
     args = parser.parse_args()
 
-    import lmdb
+    from msaflow.data.shard_store import ShardStore
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    env = lmdb.open(
-        args.lmdb_path,
-        readonly=True,
-        lock=False,
-        readahead=False,
-        meminit=False,
-        subdir=False,
-        map_size=500 * 1024 ** 3,
-    )
-
-    neff_list = []
+    # Neff is a precomputed index column — one Parquet read, no shard access.
+    store = ShardStore(args.store_path)
+    neff = store.all_neff()
+    if args.sample_every > 1:
+        neff = neff[::args.sample_every]
     n_missing = 0
-    t0 = time.time()
 
-    with env.begin() as txn:
-        cursor = txn.cursor()
-        for i, val_bytes in enumerate(cursor.iternext(keys=False, values=True)):
-            if args.sample_every > 1 and i % args.sample_every != 0:
-                continue
-            try:
-                entry = pickle.loads(val_bytes)
-                w = entry.get("weights")
-                if w is None:
-                    n_missing += 1
-                    continue
-                neff = float(np.asarray(w, dtype=np.float32).sum())
-                neff_list.append(neff)
-            except Exception:
-                n_missing += 1
-
-            if len(neff_list) % 10_000 == 0 and len(neff_list) > 0:
-                elapsed = time.time() - t0
-                print(f"  read {len(neff_list):>7,} entries  ({elapsed:.0f}s)", flush=True)
-
-    env.close()
-    elapsed = time.time() - t0
-
-    if not neff_list:
+    if neff.size == 0:
         print("ERROR: no Neff values found.", file=sys.stderr)
         sys.exit(1)
 
-    neff = np.array(neff_list, dtype=np.float32)
+    neff = np.asarray(neff, dtype=np.float32)
 
     # ── Save raw values ───────────────────────────────────────────────────────
     npy_path = out_dir / "neff_values.npy"
@@ -120,11 +90,10 @@ def main():
     stats_lines = [
         "",
         "=" * 72,
-        f"  Neff Distribution  —  {args.lmdb_path}",
+        f"  Neff Distribution  —  {args.store_path}",
         "=" * 72,
         f"  Entries read  : {len(neff):,}  (sample_every={args.sample_every})",
         f"  Missing weights: {n_missing}",
-        f"  Elapsed        : {elapsed:.1f}s",
         "",
         f"  Mean   : {neff.mean():>10.2f}",
         f"  Std    : {neff.std():>10.2f}",

@@ -14,8 +14,8 @@
 REPO_DIR=/home/yjlee4/MSA_FLOW
 SANDBOX=/home/yjlee4/msaflow_sandbox
 
-LMDB_PATH=${LMDB_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb}
-VAL_LMDB_PATH=${VAL_LMDB_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_fold.lmdb}
+STORE_PATH=${STORE_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_merged}
+VAL_STORE_PATH=${VAL_STORE_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_fold}
 OUTPUT_DIR=${OUTPUT_DIR:-/gpfs/deepfold/users/yjlee4/decoder}
 
 # CONFIG is overridable so one script serves both geometries:
@@ -35,8 +35,8 @@ echo "============================================================"
 echo " Job ID      : $SLURM_JOB_ID"
 echo " Node        : $SLURMD_NODENAME"
 echo " GPUs        : $CUDA_VISIBLE_DEVICES"
-echo " LMDB        : $LMDB_PATH"
-echo " VAL_LMDB    : $VAL_LMDB_PATH"
+echo " STORE       : $STORE_PATH"
+echo " VAL_STORE   : $VAL_STORE_PATH"
 echo " OUTPUT_DIR  : $OUTPUT_DIR"
 echo " CONFIG      : $CONFIG"
 echo " Started     : $(date)"
@@ -50,21 +50,21 @@ export NCCL_SHM_DISABLE=0   # shared memory 통신 사용
 export OMP_NUM_THREADS=8
 
 # ── Apptainer + uv run ────────────────────────────────────────────────────────
-# val lmdb가 train lmdb와 같은 디렉토리이면 동일 마운트 재사용, 다르면 별도 바인드
-LMDB_DIR="$(dirname "$LMDB_PATH")"
-VAL_LMDB_DIR="$(dirname "$VAL_LMDB_PATH")"
+# val store가 train store와 같은 디렉토리이면 동일 마운트 재사용, 다르면 별도 바인드
+STORE_DIR="$(dirname "$STORE_PATH")"
+VAL_STORE_DIR="$(dirname "$VAL_STORE_PATH")"
 
 EXTRA_BIND=""
-if [ "$VAL_LMDB_DIR" != "$LMDB_DIR" ]; then
-    EXTRA_BIND="--bind ${VAL_LMDB_DIR}:/mnt/val_lmdb"
-    VAL_LMDB_MOUNT="/mnt/val_lmdb/$(basename "$VAL_LMDB_PATH")"
+if [ "$VAL_STORE_DIR" != "$STORE_DIR" ]; then
+    EXTRA_BIND="--bind ${VAL_STORE_DIR}:/mnt/val_store"
+    VAL_STORE_MOUNT="/mnt/val_store/$(basename "$VAL_STORE_PATH")"
 else
-    VAL_LMDB_MOUNT="/mnt/lmdb/$(basename "$VAL_LMDB_PATH")"
+    VAL_STORE_MOUNT="/mnt/store/$(basename "$VAL_STORE_PATH")"
 fi
 
 apptainer exec --nv \
     --bind "$REPO_DIR":/mnt/MSA_FLOW \
-    --bind "$LMDB_DIR":/mnt/lmdb \
+    --bind "$STORE_DIR":/mnt/store \
     ${EXTRA_BIND:+$EXTRA_BIND} \
     --bind "$OUTPUT_DIR":/mnt/output \
     --env WANDB_API_KEY="${WANDB_API_KEY:-}" \
@@ -76,10 +76,10 @@ apptainer exec --nv \
         uv run accelerate launch \
             --config_file $ACCEL_CONFIG \
             msaflow/training/train_decoder.py \
-            --config        $CONFIG \
-            --lmdb_path     /mnt/lmdb/$(basename "$LMDB_PATH") \
-            --val_lmdb_path $VAL_LMDB_MOUNT \
-            --output_dir    /mnt/output
+            --config         $CONFIG \
+            --store_path     /mnt/store/$(basename "$STORE_PATH") \
+            --val_store_path $VAL_STORE_MOUNT \
+            --output_dir     /mnt/output
     "
 
 echo "============================================================"

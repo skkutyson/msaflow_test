@@ -8,7 +8,7 @@
 # Usage:
 #   accelerate launch msaflow/training/train_decoder.py \
 #       --config msaflow/configs/decoder_overfit.yaml \
-#       --lmdb_path /gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb \
+#       --store_path /gpfs/deepfold/users/yjlee4/msaflow_merged \
 #       --output_dir /runs/decoder_overfit
 
 model:
@@ -21,7 +21,7 @@ model:
   max_seq_len: 1024
 
 data:
-  lmdb_path: /gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb
+  store_path: /gpfs/deepfold/users/yjlee4/msaflow_merged
   n_seqs_per_msa: 32
   max_seq_len: 1024
   batch_size: 1

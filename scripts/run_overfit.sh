@@ -42,8 +42,8 @@ ALPHA="${ALPHA:-}"                # α-geometry: empty=use config (0.0), 0.5=α-
 # ── derive ────────────────────────────────────────────────────────────────────
 A3M_FILE="$(readlink -f "$A3M_FILE")"
 [ -f "$A3M_FILE" ] || { echo "ERROR: a3m not found: $A3M_FILE"; exit 1; }
-TARGET_ID="$(basename "$A3M_FILE" .a3m)"          # a3m stem == LMDB key
-LMDB="$WORK_DIR/${TARGET_ID}.lmdb"
+TARGET_ID="$(basename "$A3M_FILE" .a3m)"          # a3m stem == store key
+STORE="$WORK_DIR/${TARGET_ID}"
 # separate output per α so α=0 and α=0.5 runs don't overwrite each other
 ALPHA_TAG="${ALPHA:+_a${ALPHA}}"
 OUT_DIR="$WORK_DIR/decoder_${TARGET_ID}${ALPHA_TAG}"
@@ -68,24 +68,23 @@ echo "============================================================"
 echo " MSAFlow single-target OVERFIT test"
 echo "   target : $TARGET_ID"
 echo "   a3m    : $A3M_FILE"
-echo "   lmdb   : $LMDB"
+echo "   store  : $STORE"
 echo "   out    : $OUT_DIR"
 echo "   n_cycle: $N_CYCLE   gpu: $GPU   ccd: $CCD_DIR"
 echo "   alpha  : ${ALPHA:-config default (0.0)}"
 echo "============================================================"
 
-# ── 1) build single-target LMDB (skip if present) ─────────────────────────────
-if [ -e "$LMDB" ]; then
-    echo "== [1/2] LMDB exists, skipping preprocess (rm '$LMDB' to rebuild) =="
+# ── 1) build single-target store (skip if present) ────────────────────────────
+if [ -e "$STORE" ]; then
+    echo "== [1/2] store exists, skipping preprocess (rm -r '$STORE' to rebuild) =="
 else
-    echo "== [1/2] build single-target LMDB (faithful Protenix, n_cycle=$N_CYCLE) =="
+    echo "== [1/2] build single-target store (faithful Protenix, n_cycle=$N_CYCLE) =="
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     uv run python -m msaflow.data.preprocessing \
         --a3m_dir "$STAGE_DIR" \
-        --output "$LMDB" \
+        --output "$STORE" \
         --protenix_checkpoint "$PROTENIX_CKPT" \
         --n_cycle "$N_CYCLE" \
-        --map_size_gb 5 \
         --device cuda
 fi
 
@@ -95,7 +94,7 @@ uv run accelerate launch \
     --config_file "$REPO_DIR/msaflow/configs/accelerate_1gpu.yaml" \
     msaflow/training/train_decoder.py \
     --config "$CONFIG" \
-    --lmdb_path "$LMDB" \
+    --store_path "$STORE" \
     --output_dir "$OUT_DIR" \
     ${ALPHA:+--alpha "$ALPHA"}
 

@@ -10,16 +10,18 @@ Two datasets are provided:
   LatentFMDataset — for training the latent flow matching encoder.
     Each item: (msa_emb, esm_emb)
     One-to-one: query embedding → MSA embedding.
+
+Both read from the sharded binary store written by preprocessing (see
+msaflow.data.shard_store), which replaced the NFS-incompatible LMDB.
 """
 
 import logging
-import pickle
-import random
 
-import lmdb
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+from msaflow.data.shard_store import ShardStore
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +30,7 @@ class MSADecoderDataset(Dataset):
     """
     Dataset for training the SFM decoder.
 
-    Reads from the LMDB written by preprocessing.build_lmdb().
+    Reads from the ShardStore written by preprocessing.build_store().
     Each __getitem__ samples `n_seqs_per_msa` sequences from the MSA
     (weighted by Neff weights), returning:
       - msa_emb:   (L, 128) compressed MSA embedding  [float16 → float32]
@@ -36,58 +38,27 @@ class MSADecoderDataset(Dataset):
       - weights:   (n_seqs,) Neff weights for the sampled sequences
 
     Args:
-        lmdb_path:       Path to the LMDB database.
+        store_path:      Path to the ShardStore directory.
         n_seqs_per_msa:  Number of sequences to sample per MSA (paper uses 32).
         max_seq_len:     Crop/pad to this length.
-        require_msa_emb: If True, skip entries without a precomputed MSA embedding.
     """
 
     def __init__(
         self,
-        lmdb_path: str,
+        store_path: str,
         n_seqs_per_msa: int = 32,
         max_seq_len: int = 1024,
-        require_msa_emb: bool = True,
     ):
-        self.env = lmdb.open(
-            lmdb_path,
-            readonly=True,
-            lock=False,
-            readahead=False,
-            meminit=False,
-            subdir=False,
-        )
+        self.store = ShardStore(store_path)
         self.n_seqs = n_seqs_per_msa
         self.max_len = max_seq_len
-        self.require_msa_emb = require_msa_emb
-
-        with self.env.begin() as txn:
-            all_keys = [k.decode() for k in txn.cursor().iternext(keys=True, values=False)]
-
-        if require_msa_emb:
-            # Spot-check a random subset for msa_emb rather than scanning all
-            # 250k+ entries (a full scan takes ~15 min).
-            sample = random.sample(all_keys, min(100, len(all_keys)))
-            missing = 0
-            with self.env.begin() as txn:
-                for k in sample:
-                    entry = pickle.loads(txn.get(k.encode()))
-                    if entry.get("msa_emb") is None:
-                        missing += 1
-            if missing > 0:
-                logger.warning(
-                    "%d/%d sampled entries missing msa_emb — "
-                    "set require_msa_emb=False or re-run preprocessing with Protenix",
-                    missing, len(sample),
-                )
-        self.keys = all_keys
+        self.keys = self.store.keys()
 
     def __len__(self) -> int:
         return len(self.keys)
 
     def __getitem__(self, idx: int) -> dict:
-        with self.env.begin() as txn:
-            entry = pickle.loads(txn.get(self.keys[idx].encode()))
+        entry = self.store.get(self.keys[idx])
 
         tokens_all = torch.from_numpy(entry["msa_tokens"].astype(np.int64))   # (N, L)
         weights_all = torch.from_numpy(entry["weights"].astype(np.float32))   # (N,)
@@ -122,39 +93,21 @@ class LatentFMDataset(Dataset):
     Each item is a (msa_emb, esm_emb) pair for the query sequence.
 
     Args:
-        lmdb_path:   Path to LMDB.
+        store_path:  Path to the ShardStore directory.
         max_seq_len: Crop to this length.
     """
 
-    def __init__(self, lmdb_path: str, max_seq_len: int = 1024):
-        self.env = lmdb.open(
-            lmdb_path,
-            readonly=True,
-            lock=False,
-            readahead=False,
-            meminit=False,
-            subdir=False,
-        )
+    def __init__(self, store_path: str, max_seq_len: int = 1024):
+        self.store = ShardStore(store_path)
         self.max_len = max_seq_len
-
-        with self.env.begin() as txn:
-            all_keys = [k.decode() for k in txn.cursor().iternext(keys=True, values=False)]
-
-        # Keep only entries that have both embeddings.
-        valid = []
-        with self.env.begin() as txn:
-            for k in all_keys:
-                entry = pickle.loads(txn.get(k.encode()))
-                if entry.get("msa_emb") is not None and entry.get("esm_emb") is not None:
-                    valid.append(k)
-        self.keys = valid
+        # Every entry carries both embeddings by construction.
+        self.keys = self.store.keys()
 
     def __len__(self) -> int:
         return len(self.keys)
 
     def __getitem__(self, idx: int) -> dict:
-        with self.env.begin() as txn:
-            entry = pickle.loads(txn.get(self.keys[idx].encode()))
+        entry = self.store.get(self.keys[idx])
 
         L = min(entry["seq_len"], self.max_len)
         msa_emb = torch.from_numpy(entry["msa_emb"].astype(np.float32))[:L]   # (L, 128)

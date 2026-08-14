@@ -19,7 +19,7 @@ model:
   max_seq_len: 1024
 
 data:
-  lmdb_path: /gpfs/deepfold/users/yjlee4/msaflow_fold.lmdb
+  store_path: /gpfs/deepfold/users/yjlee4/msaflow_fold
   max_seq_len: 1024
   batch_size: 4           # per-GPU; effective batch = 4×4 GPUs×2 accum = 32
   num_workers: 4

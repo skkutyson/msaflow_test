@@ -15,7 +15,7 @@ module load python/3.11.14
 export PATH="$HOME/.local/bin:$PATH"
 
 REPO_DIR=${REPO_DIR:-/home/paul3875/projects/MSA_FLOW}
-LMDB_PATH=${LMDB_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_merged.lmdb}
+STORE_PATH=${STORE_PATH:-/gpfs/deepfold/users/yjlee4/msaflow_merged}
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO_DIR/runs/decoder_overfit}
 CONFIG=$REPO_DIR/msaflow/configs/decoder_overfit.yaml
 
@@ -39,7 +39,7 @@ accelerate launch \
     --config_file $ACCEL_CONFIG \
     $REPO_DIR/msaflow/training/train_decoder.py \
     --config $CONFIG \
-    --lmdb_path $LMDB_PATH \
+    --store_path $STORE_PATH \
     --output_dir $OUTPUT_DIR
 
 echo "Done: $(date)"

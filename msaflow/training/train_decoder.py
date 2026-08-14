@@ -11,7 +11,7 @@ Matches the paper's setup (Section 6.8.2):
 
 Usage:
     accelerate launch --num_processes 4 msaflow/training/train_decoder.py \
-        --lmdb_path /data/msaflow.lmdb \
+        --store_path /data/msaflow_openfold \
         --output_dir /runs/decoder \
         --config msaflow/configs/decoder.yaml
 """
@@ -308,7 +308,7 @@ def save_val_examples(
             f.write(f"{'─'*72}\n\n")
 
             # Reference sequences
-            f.write("Reference (from val LMDB):\n")
+            f.write("Reference (from val store):\n")
             for si, seq in enumerate(_tokens_to_strs(ref_tokens[:n])):
                 f.write(f"  ref[{si}]: {seq}\n")
 
@@ -459,7 +459,7 @@ def train(cfg):
 
     # ── Data ─────────────────────────────────────────────────────────────────
     dataset = MSADecoderDataset(
-        lmdb_path=cfg.data.lmdb_path,
+        store_path=cfg.data.store_path,
         n_seqs_per_msa=cfg.data.n_seqs_per_msa,
         max_seq_len=cfg.data.max_seq_len,
     )
@@ -591,14 +591,14 @@ def train(cfg):
     val_items = []
     if val_every > 0 and accelerator.is_main_process:
         K = cfg.training.get("val_proteins", 16)
-        val_lmdb_path = cfg.data.get("val_lmdb_path", None)
-        if val_lmdb_path:
+        val_store_path = cfg.data.get("val_store_path", None)
+        if val_store_path:
             val_ds = MSADecoderDataset(
-                lmdb_path=val_lmdb_path,
+                store_path=val_store_path,
                 n_seqs_per_msa=cfg.data.n_seqs_per_msa,
                 max_seq_len=cfg.data.max_seq_len,
             )
-            logger.info("Validation dataset: %s  (%d entries)", val_lmdb_path, len(val_ds))
+            logger.info("Validation dataset: %s  (%d entries)", val_store_path, len(val_ds))
         else:
             val_ds = dataset.dataset if hasattr(dataset, "dataset") else dataset
         n_total = len(val_ds)
@@ -614,7 +614,7 @@ def train(cfg):
             })
         logger.info("Validation: %d proteins selected from %s (indices %s...)",
                     len(val_items),
-                    val_lmdb_path or "train dataset",
+                    val_store_path or "train dataset",
                     val_indices[:4])
 
     # Ensure all ranks are in sync before entering the training loop.
@@ -819,18 +819,18 @@ def train(cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",        required=True,  help="Path to decoder.yaml config")
-    parser.add_argument("--lmdb_path",     default=None,   help="Override data.lmdb_path")
-    parser.add_argument("--val_lmdb_path", default=None,   help="Override data.val_lmdb_path")
+    parser.add_argument("--store_path",     default=None,   help="Override data.store_path")
+    parser.add_argument("--val_store_path", default=None,   help="Override data.val_store_path")
     parser.add_argument("--output_dir",    default=None,   help="Override training.output_dir")
     parser.add_argument("--alpha",         default=None, type=float,
                         help="Override model.alpha (α-geometry; 0.0=L² sphere/SFM, 0.5=L⁴/α-Flow)")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
-    if args.lmdb_path:
-        cfg.data.lmdb_path = args.lmdb_path
-    if args.val_lmdb_path:
-        cfg.data.val_lmdb_path = args.val_lmdb_path
+    if args.store_path:
+        cfg.data.store_path = args.store_path
+    if args.val_store_path:
+        cfg.data.val_store_path = args.val_store_path
     if args.output_dir:
         cfg.training.output_dir = args.output_dir
     if args.alpha is not None:

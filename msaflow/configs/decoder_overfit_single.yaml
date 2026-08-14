@@ -6,7 +6,7 @@
 # conditioning scale, broken msa_emb, etc.) — cheaper to catch here than on
 # the full run.
 #
-# Usage: driven by scripts/run_overfit.sh, which overrides lmdb_path/output_dir
+# Usage: driven by scripts/run_overfit.sh, which overrides store_path/output_dir
 # for whatever target a3m you point it at:
 #   A3M_FILE=/path/to/target.a3m bash scripts/run_overfit.sh
 
@@ -21,7 +21,7 @@ model:
   # alpha: 0.0            # α-geometry (0.0 = L² sphere / SFM). set 0.5 for α-Flow.
 
 data:
-  lmdb_path: PLACEHOLDER   # overridden by run_overfit.sh via --lmdb_path
+  store_path: PLACEHOLDER   # overridden by run_overfit.sh via --store_path
   n_seqs_per_msa: 32
   max_seq_len: 1024
   batch_size: 1

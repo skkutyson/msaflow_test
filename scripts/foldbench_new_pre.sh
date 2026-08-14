@@ -14,16 +14,16 @@ REPO_DIR=/home/yjlee4/MSA_FLOW
 SANDBOX=/home/yjlee4/msaflow_sandbox
 
 A3M_DIR=${A3M_DIR:-/gpfs/deepfold/users/yjlee4/foldbench_search}
-OUTPUT_LMDB=${OUTPUT_LMDB:-/gpfs/deepfold/users/yjlee4/msaflow_new_fold.lmdb}
+OUTPUT_STORE=${OUTPUT_STORE:-/gpfs/deepfold/users/yjlee4/msaflow_new_fold}
 PROTENIX_CKPT_CONTAINER=/mnt/MSA_FLOW/checkpoints/checkpoints/protenix_base_default_v1.0.0.pt
 
 MAX_MSA_SEQS=${MAX_MSA_SEQS:-512}
 MAX_SEQ_LEN=${MAX_SEQ_LEN:-1024}
-MAP_SIZE_GB=${MAP_SIZE_GB:-500}
+SHARD_MAX_GB=${SHARD_MAX_GB:-4}
 PROTEIN_LIST=${PROTEIN_LIST:-}
 
 # ── 로그 디렉터리 생성 ─────────────────────────────────────────────────────────
-mkdir -p "$REPO_DIR/logs" "$(dirname "$OUTPUT_LMDB")"
+mkdir -p "$REPO_DIR/logs" "$(dirname "$OUTPUT_STORE")"
 
 echo "============================================================"
 echo " MSAFlow Preprocessing — ColabFold A3M (SLURM + Apptainer)"
@@ -34,7 +34,7 @@ echo " GPUs        : $CUDA_VISIBLE_DEVICES"
 echo " REPO_DIR    : $REPO_DIR"
 echo " SANDBOX     : $SANDBOX"
 echo " A3M_DIR     : $A3M_DIR"
-echo " OUTPUT_LMDB : $OUTPUT_LMDB"
+echo " OUTPUT_STORE : $OUTPUT_STORE"
 echo " PROTENIX    : ${PROTENIX_CKPT_CONTAINER} (inside container)"
 echo " MAX_MSA     : $MAX_MSA_SEQS  |  MAX_LEN: $MAX_SEQ_LEN"
 echo " Started     : $(date)"
@@ -43,7 +43,7 @@ echo "============================================================"
 apptainer exec --nv \
     --bind "$REPO_DIR":/mnt/MSA_FLOW \
     --bind "$A3M_DIR":/mnt/data \
-    --bind "$(dirname "$OUTPUT_LMDB")":/mnt/output \
+    --bind "$(dirname "$OUTPUT_STORE")":/mnt/output \
     "$SANDBOX" \
     bash -c "
         set -euo pipefail
@@ -53,12 +53,12 @@ apptainer exec --nv \
         PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         uv run python3 -m msaflow.data.preprocessing \
             --a3m_dir      /mnt/data \
-            --output       /mnt/output/$(basename "$OUTPUT_LMDB") \
+            --output       /mnt/output/$(basename "$OUTPUT_STORE") \
             --protenix_checkpoint $PROTENIX_CKPT_CONTAINER \
             --max_msa_seqs $MAX_MSA_SEQS \
             --max_seq_len  $MAX_SEQ_LEN \
             --device       cuda \
-            --map_size_gb  $MAP_SIZE_GB \
+            --shard_max_gb $SHARD_MAX_GB \
             ${PROTEIN_LIST:+--protein_list $PROTEIN_LIST}
     "
 

@@ -11,7 +11,7 @@ Matches the paper's setup (Section 6.8.2):
 Usage:
     accelerate launch --num_processes 4 msaflow/training/train_latent_fm.py \
         --config msaflow/configs/latent_fm.yaml \
-        --lmdb_path /data/msaflow.lmdb \
+        --store_path /data/msaflow_openfold \
         --output_dir /runs/latent_fm
 """
 
@@ -66,7 +66,7 @@ def train(cfg):
 
     # ── Data ─────────────────────────────────────────────────────────────────
     dataset = LatentFMDataset(
-        lmdb_path=cfg.data.lmdb_path,
+        store_path=cfg.data.store_path,
         max_seq_len=cfg.data.max_seq_len,
     )
     if accelerator.is_main_process:
@@ -240,13 +240,13 @@ def train(cfg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",     required=True)
-    parser.add_argument("--lmdb_path",  default=None)
+    parser.add_argument("--store_path", default=None)
     parser.add_argument("--output_dir", default=None)
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
-    if args.lmdb_path:
-        cfg.data.lmdb_path = args.lmdb_path
+    if args.store_path:
+        cfg.data.store_path = args.store_path
     if args.output_dir:
         cfg.training.output_dir = args.output_dir
 

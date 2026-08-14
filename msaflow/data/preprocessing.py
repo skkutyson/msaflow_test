@@ -15,22 +15,19 @@ Two preprocessing stages:
    Computes ESM2-650M representations (L×1280) for query sequences and stores
    them alongside the MSA embeddings.
 
-Both functions write to the same LMDB, keyed by protein/MSA ID.
-
-LMDB schema per entry (pickled dict):
-  {
-    "msa_emb":     torch.Tensor  [L, 128]   – compressed MSA embedding
-    "esm_emb":     torch.Tensor  [L, 1280]  – ESM2 query embedding
-    "msa_tokens":  torch.Tensor  [N, L]     – integer token ids (0..21)
-    "weights":     torch.Tensor  [N]        – Neff reweighting
-    "query_seq":   str                      – query sequence (no gaps)
-    "seq_len":     int                      – L
-  }
+Both functions write to the same ShardStore (msaflow.data.shard_store), keyed by
+protein/MSA ID. Per protein the store holds:
+    msa_emb     [L, 128]   – compressed MSA embedding   (float16)
+    esm_emb     [L, 1280]  – ESM2 query embedding        (float16)
+    msa_tokens  [N, L]     – integer token ids (0..21)   (int8)
+    weights     [N]        – Neff reweighting            (float32)
+    seq_len = L, plus a Parquet index with a precomputed neff column.
+The store is a directory of plain append-only binary shards (NFS/GPFS-safe),
+replacing the previous LMDB.
 """
 
 import os
 import sys
-import pickle
 import logging
 import time
 from collections import defaultdict
@@ -40,8 +37,9 @@ from typing import Optional
 
 import numpy as np
 import torch
-import lmdb
 from tqdm import tqdm
+
+from msaflow.data.shard_store import ShardStoreWriter
 
 # ── Alphabet shared between MSA tokenisation and SFM decoder ─────────────────
 # 20 canonical AAs (ACDEFGHIKLMNPQRSTVWY), gap '-', unknown 'X'
@@ -440,14 +438,14 @@ def _a3m_key(path: Path) -> str:
     return parent.name
 
 
-def build_lmdb(
+def build_store(
     a3m_dir: str,
     output_path: str,
     protenix_checkpoint: Optional[str] = None,
     max_msa_seqs: int = 512,
     max_seq_len: int = 1024,
     device: str = "cuda",
-    map_size_gb: int = 500,
+    shard_max_gb: float = 4.0,
     protein_list: Optional[str] = None,
     n_cycle: int = 3,
     a3m_name: Optional[str] = None,
@@ -455,32 +453,32 @@ def build_lmdb(
     a3m_list: Optional[str] = None,
 ):
     """
-    Process all A3M files in a3m_dir and write LMDB database.
+    Process all A3M files in a3m_dir and write a ShardStore directory.
 
     Args:
         a3m_dir:              Directory containing *.a3m files.
-        output_path:          Path for the output LMDB.
+        output_path:          Path for the output store directory.
         protenix_checkpoint:  Path to Protenix checkpoint. If None, skip MSA emb.
         max_msa_seqs:         Maximum MSA depth to use.
         max_seq_len:          Maximum sequence length.
         device:               Compute device string.
-        map_size_gb:          LMDB map size in GB.
+        shard_max_gb:         Shard size cap in GB (driven by the esm_emb array).
         protein_list:         Optional path to a text file with one protein ID per line.
                               When provided, only those proteins are processed.
         n_cycle:              Protenix recycling cycles for MSA embedding extraction.
         a3m_name:             Exact a3m filename to process (e.g. "uniclust30.a3m").
                               Required for OpenProteinSet-style trees where each
                               protein dir holds several db a3ms; None = every .a3m.
-        resume:               Skip proteins whose key already exists in the LMDB.
+        resume:               Skip proteins whose id already exists in the store.
         a3m_list:             Text file with one a3m path per line. Skips the
                               directory scan; defaults to the auto-written cache
                               at <output>.a3m_list.txt when that exists.
     """
-    logger.info("build_lmdb started")
+    logger.info("build_store started")
     logger.info("  a3m_dir    : %s", a3m_dir)
     logger.info("  output     : %s", output_path)
     logger.info("  max_seq_len: %d  max_msa_seqs: %d", max_seq_len, max_msa_seqs)
-    logger.info("  device     : %s  map_size: %dGB", device, map_size_gb)
+    logger.info("  device     : %s  shard_max: %.1fGB", device, shard_max_gb)
     logger.info("  protenix   : %s  n_cycle: %d", protenix_checkpoint or "disabled", n_cycle)
     logger.info("  a3m_name   : %s  resume: %s", a3m_name or "*.a3m", resume)
 
@@ -576,25 +574,27 @@ def build_lmdb(
             "per protein.", len(a3m_files), n_keys,
         )
 
-    env = lmdb.open(
+    writer = ShardStoreWriter(
         output_path,
-        map_size=map_size_gb * (1024 ** 3),
-        subdir=False,
-        meminit=False,
-        map_async=True,
+        shard_max_gb=shard_max_gb,
+        meta_extra={
+            "vocab_size": VOCAB_SIZE,
+            "max_msa_seqs": max_msa_seqs,
+            "max_seq_len": max_seq_len,
+            "n_cycle": n_cycle,
+        },
     )
 
     if resume:
-        with env.begin() as txn:
-            existing = {k.decode() for k, _ in txn.cursor()}
+        existing = writer.existing_ids()
         n_before = len(a3m_files)
         a3m_files = [p for p in a3m_files if _a3m_key(p) not in existing]
-        logger.info("Resume: %d keys already in LMDB, %d a3m files remaining",
+        logger.info("Resume: %d ids already in store, %d a3m files remaining",
                     n_before - len(a3m_files), len(a3m_files))
 
     stats = PreprocessStats(n_total=len(a3m_files))
 
-    for file_idx, a3m_path in enumerate(tqdm(a3m_files, desc="Building LMDB")):
+    for file_idx, a3m_path in enumerate(tqdm(a3m_files, desc="Building store")):
         key = _a3m_key(a3m_path)
         try:
             # ── Parse ────────────────────────────────────────────────────────
@@ -667,8 +667,18 @@ def build_lmdb(
                     continue
 
             # ── Write ────────────────────────────────────────────────────────
-            with env.begin(write=True) as txn:
-                txn.put(key.encode(), pickle.dumps(entry))
+            # The store requires the residue-axis msa_emb (aligned with esm_emb);
+            # without the Protenix path there is no msa_emb to store.
+            if entry["msa_emb"] is None:
+                stats.skip("no_msa_emb")
+                continue
+            writer.append(
+                key,
+                msa_emb=entry["msa_emb"],
+                esm_emb=entry["esm_emb"],
+                msa_tokens=entry["msa_tokens"],
+                weights=entry["weights"],
+            )
             stats.record(L_query, N, weights)
 
         except Exception as exc:
@@ -677,7 +687,7 @@ def build_lmdb(
             if dev.type == "cuda":
                 torch.cuda.empty_cache()
 
-    env.close()
+    writer.close()
     stats.log_summary()
 
 
@@ -693,14 +703,16 @@ if __name__ == "__main__":
         format="%(asctime)s  [ %(name)s ]  %(message)s",
         datefmt="%Y-%m-%d %H:%M",
     )
-    parser = argparse.ArgumentParser(description="Build MSAFlow LMDB dataset")
+    parser = argparse.ArgumentParser(description="Build MSAFlow ShardStore dataset")
     parser.add_argument("--a3m_dir",              required=True)
-    parser.add_argument("--output",               required=True)
+    parser.add_argument("--output",               required=True,
+                        help="Output store directory")
     parser.add_argument("--protenix_checkpoint",  default=None)
     parser.add_argument("--max_msa_seqs",         type=int, default=512)
     parser.add_argument("--max_seq_len",          type=int, default=1024)
     parser.add_argument("--device",               default="cuda")
-    parser.add_argument("--map_size_gb",          type=int, default=500)
+    parser.add_argument("--shard_max_gb",         type=float, default=4.0,
+                        help="Shard size cap in GB (driven by the esm_emb array)")
     parser.add_argument("--protein_list",          default=None,
                         help="Text file with one protein ID per line to process (optional)")
     parser.add_argument("--n_cycle",              type=int, default=3,
@@ -709,20 +721,20 @@ if __name__ == "__main__":
                         help="Exact a3m filename to process (e.g. uniclust30.a3m); "
                              "default processes every .a3m under --a3m_dir")
     parser.add_argument("--resume",               action="store_true",
-                        help="Skip proteins whose key already exists in the LMDB")
+                        help="Skip proteins whose id already exists in the store")
     parser.add_argument("--a3m_list",             default=None,
                         help="Text file with one a3m path per line (skips the "
                              "directory scan; auto-cached at <output>.a3m_list.txt)")
     args = parser.parse_args()
 
-    build_lmdb(
+    build_store(
         a3m_dir=args.a3m_dir,
         output_path=args.output,
         protenix_checkpoint=args.protenix_checkpoint,
         max_msa_seqs=args.max_msa_seqs,
         max_seq_len=args.max_seq_len,
         device=args.device,
-        map_size_gb=args.map_size_gb,
+        shard_max_gb=args.shard_max_gb,
         protein_list=args.protein_list,
         n_cycle=args.n_cycle,
         a3m_name=args.a3m_name,

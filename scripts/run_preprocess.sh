@@ -1,5 +1,5 @@
 #!/bin/bash
-# Full LMDB build from an OpenProteinSet-style a3m tree — native uv,
+# Full ShardStore build from an OpenProteinSet-style a3m tree — native uv,
 # no apptainer / no SLURM (same style as run_overfit.sh).
 #
 # Point it at the a3m root dir. Handles both layouts:
@@ -17,11 +17,11 @@
 #
 # Common overrides (env vars):
 #   A3M_DIR        (required, or pass as arg 1) a3m root directory
-#   OUTPUT_LMDB    output LMDB path            (default: $HOME/data/msaflow_openfold.lmdb)
+#   OUTPUT_STORE   output store directory      (default: $HOME/data/msaflow_openfold)
 #   A3M_NAME       exact a3m filename to use   (default: uniclust30.a3m; ""=every .a3m)
 #   A3M_LIST       txt with one a3m path/line  (skips the slow dir scan; the scan
-#                  result is auto-cached at <OUTPUT_LMDB>.a3m_list.txt anyway)
-#   RESUME         1=skip keys already in LMDB (default: 1)
+#                  result is auto-cached at <OUTPUT_STORE>.a3m_list.txt anyway)
+#   RESUME         1=skip ids already in store (default: 1)
 #   PROTEIN_LIST   optional txt, one ID per line, to restrict targets
 #   PROTENIX_CKPT  Protenix checkpoint .pt     (default: <repo>/checkpoints/...)
 #   CCD_DIR        dir holding components.cif  (default: $HOME/common)
@@ -29,7 +29,7 @@
 #   GPU            CUDA device index           (default: 0)
 #   MAX_MSA_SEQS   MSA depth cap               (default: 512)
 #   MAX_SEQ_LEN    sequence length cap         (default: 1024)
-#   MAP_SIZE_GB    LMDB max size               (default: 500)
+#   SHARD_MAX_GB   shard size cap in GB        (default: 4)
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -43,7 +43,7 @@ if [ -z "$A3M_DIR" ]; then
     echo "     or: A3M_DIR=/path/to/uniclust30 bash scripts/run_preprocess.sh"
     exit 1
 fi
-OUTPUT_LMDB="${OUTPUT_LMDB:-$HOME/data/msaflow_openfold.lmdb}"
+OUTPUT_STORE="${OUTPUT_STORE:-$HOME/data/msaflow_openfold}"
 A3M_NAME="${A3M_NAME-uniclust30.a3m}"
 A3M_LIST="${A3M_LIST:-}"
 RESUME="${RESUME:-1}"
@@ -54,7 +54,7 @@ N_CYCLE="${N_CYCLE:-3}"
 GPU="${GPU:-0}"
 MAX_MSA_SEQS="${MAX_MSA_SEQS:-512}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
-MAP_SIZE_GB="${MAP_SIZE_GB:-500}"
+SHARD_MAX_GB="${SHARD_MAX_GB:-4}"
 
 export PROTENIX_ROOT_DIR="$(dirname "$CCD_DIR")"  # Protenix reads $PROTENIX_ROOT_DIR/common
 export CUDA_VISIBLE_DEVICES="$GPU"
@@ -74,32 +74,32 @@ done
 [ -z "$A3M_LIST" ] || [ -f "$A3M_LIST" ] || { echo "ERROR: a3m list not found: $A3M_LIST"; exit 1; }
 command -v uv >/dev/null || { echo "ERROR: uv not found (run scripts/setup_native_uv.sh first)"; exit 1; }
 
-mkdir -p "$(dirname "$OUTPUT_LMDB")"
+mkdir -p "$(dirname "$OUTPUT_STORE")"
 
 echo "============================================================"
-echo " MSAFlow LMDB build (native uv, no SLURM)"
+echo " MSAFlow ShardStore build (native uv, no SLURM)"
 echo "   a3m_dir : $A3M_DIR"
 echo "   a3m_name: ${A3M_NAME:-<all *.a3m>}   resume: $RESUME"
-echo "   lmdb    : $OUTPUT_LMDB"
+echo "   store   : $OUTPUT_STORE"
 echo "   ckpt    : $PROTENIX_CKPT"
 echo "   n_cycle : $N_CYCLE   gpu: $GPU   ccd: $CCD_DIR"
-echo "   max_msa : $MAX_MSA_SEQS   max_len: $MAX_SEQ_LEN   map: ${MAP_SIZE_GB}GB"
+echo "   max_msa : $MAX_MSA_SEQS   max_len: $MAX_SEQ_LEN   shard: ${SHARD_MAX_GB}GB"
 echo "   list    : ${PROTEIN_LIST:-<none>}"
 echo "============================================================"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 uv run python -m msaflow.data.preprocessing \
     --a3m_dir "$A3M_DIR" \
-    --output "$OUTPUT_LMDB" \
+    --output "$OUTPUT_STORE" \
     --protenix_checkpoint "$PROTENIX_CKPT" \
     --max_msa_seqs "$MAX_MSA_SEQS" \
     --max_seq_len "$MAX_SEQ_LEN" \
     --device cuda \
-    --map_size_gb "$MAP_SIZE_GB" \
+    --shard_max_gb "$SHARD_MAX_GB" \
     --n_cycle "$N_CYCLE" \
     ${A3M_NAME:+--a3m_name "$A3M_NAME"} \
     ${A3M_LIST:+--a3m_list "$A3M_LIST"} \
     ${PROTEIN_LIST:+--protein_list "$PROTEIN_LIST"} \
     $([ "$RESUME" = "1" ] && echo --resume)
 
-echo "== done: $OUTPUT_LMDB =="
+echo "== done: $OUTPUT_STORE =="

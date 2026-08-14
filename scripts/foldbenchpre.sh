@@ -14,17 +14,17 @@ REPO_DIR=/home/yjlee4/MSA_FLOW
 SANDBOX=/home/yjlee4/msaflow_sandbox
 
 A3M_DIR=${A3M_DIR:-/store/database/openfold/uniclust30}
-OUTPUT_LMDB=${OUTPUT_LMDB:-/store/yjlee4/msaflow.lmdb}
+OUTPUT_STORE=${OUTPUT_STORE:-/store/yjlee4/msaflow_openfold}
 
 # 체크포인트는 repo 안에 있으므로 컨테이너 내부 경로로 바로 지정
 PROTENIX_CKPT_CONTAINER=/mnt/MSA_FLOW/checkpoints/checkpoints/protenix_base_default_v1.0.0.pt
 
 MAX_MSA_SEQS=${MAX_MSA_SEQS:-512}
 MAX_SEQ_LEN=${MAX_SEQ_LEN:-1024}
-MAP_SIZE_GB=${MAP_SIZE_GB:-500}
+SHARD_MAX_GB=${SHARD_MAX_GB:-4}
 
 # ── 로그 디렉터리 생성 ─────────────────────────────────────────────────────────
-mkdir -p "$REPO_DIR/logs" "$(dirname "$OUTPUT_LMDB")"
+mkdir -p "$REPO_DIR/logs" "$(dirname "$OUTPUT_STORE")"
 
 echo "============================================================"
 echo " MSAFlow Preprocessing (SLURM + Apptainer)"
@@ -35,7 +35,7 @@ echo " GPUs        : $CUDA_VISIBLE_DEVICES"
 echo " REPO_DIR    : $REPO_DIR"
 echo " SANDBOX     : $SANDBOX"
 echo " A3M_DIR     : $A3M_DIR"
-echo " OUTPUT_LMDB : $OUTPUT_LMDB"
+echo " OUTPUT_STORE : $OUTPUT_STORE"
 echo " PROTENIX    : $PROTENIX_CKPT_CONTAINER (inside container)"
 echo " MAX_MSA     : $MAX_MSA_SEQS  |  MAX_LEN: $MAX_SEQ_LEN"
 echo " Started     : $(date)"
@@ -45,11 +45,11 @@ echo "============================================================"
 # bind 구성:
 #   /mnt/MSA_FLOW  → REPO_DIR (msaflow 패키지 + checkpoint + Protenix/esm 서브모듈)
 #   /mnt/data      → A3M 파일 디렉터리
-#   /mnt/output    → OUTPUT_LMDB 상위 디렉터리
+#   /mnt/output    → OUTPUT_STORE 상위 디렉터리
 apptainer exec --nv \
     --bind "$REPO_DIR":/mnt/MSA_FLOW \
     --bind "$A3M_DIR":/mnt/data \
-    --bind "$(dirname "$OUTPUT_LMDB")":/mnt/output \
+    --bind "$(dirname "$OUTPUT_STORE")":/mnt/output \
     "$SANDBOX" \
     bash -c "
         set -euo pipefail
@@ -59,12 +59,12 @@ apptainer exec --nv \
 
         python3 -m msaflow.data.preprocessing \
             --a3m_dir      /mnt/data \
-            --output       /mnt/output/$(basename "$OUTPUT_LMDB") \
+            --output       /mnt/output/$(basename "$OUTPUT_STORE") \
             --protenix_checkpoint $PROTENIX_CKPT_CONTAINER \
             --max_msa_seqs $MAX_MSA_SEQS \
             --max_seq_len  $MAX_SEQ_LEN \
             --device       cuda \
-            --map_size_gb  $MAP_SIZE_GB
+            --shard_max_gb $SHARD_MAX_GB
     "
 
 echo "============================================================"
