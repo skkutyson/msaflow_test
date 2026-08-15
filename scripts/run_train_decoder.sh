@@ -48,6 +48,15 @@ command -v uv >/dev/null || { echo "ERROR: uv not found (run scripts/setup_nativ
 
 mkdir -p "$OUTPUT_DIR" "$REPO_DIR/logs"
 
+# ── W&B (optional) ────────────────────────────────────────────────────────────
+# train_decoder only enables wandb when WANDB_API_KEY is set in the env. Pick it
+# up from ~/.wandb_api_key if present so you don't have to export it each time.
+WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-$HOME/.wandb_api_key}"
+if [ -z "${WANDB_API_KEY:-}" ] && [ -f "$WANDB_API_KEY_FILE" ]; then
+    export WANDB_API_KEY="$(cat "$WANDB_API_KEY_FILE")"
+fi
+echo "   wandb    : $([ -n "${WANDB_API_KEY:-}" ] && echo enabled || echo 'disabled (no WANDB_API_KEY)')"
+
 echo "============================================================"
 echo " MSAFlow Decoder Training (native uv, ${NUM_GPUS} GPU)"
 echo "   store    : $STORE_PATH"
