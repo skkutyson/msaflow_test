@@ -592,6 +592,10 @@ def train(cfg):
     if val_every > 0 and accelerator.is_main_process:
         K = cfg.training.get("val_proteins", 16)
         val_store_path = cfg.data.get("val_store_path", None)
+        if val_store_path and not (Path(val_store_path) / "meta.json").is_file():
+            logger.warning("val_store_path %s not found — validating on held-in "
+                           "train proteins instead", val_store_path)
+            val_store_path = None
         if val_store_path:
             val_ds = MSADecoderDataset(
                 store_path=val_store_path,
