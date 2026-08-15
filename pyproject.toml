@@ -34,8 +34,10 @@ dev = [
 ]
 
 [tool.uv.sources]
-protenix = { path = "/mnt/MSA_FLOW/Protenix", editable = true }
-fair-esm = { path = "/mnt/MSA_FLOW/esm" }
+# Relative to this pyproject.toml so it resolves both inside the container
+# (cwd /mnt/MSA_FLOW) and on native clones (repo root anywhere).
+protenix = { path = "Protenix", editable = true }
+fair-esm = { path = "esm" }
 torch = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
