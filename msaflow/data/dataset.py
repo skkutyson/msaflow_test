@@ -58,7 +58,9 @@ class MSADecoderDataset(Dataset):
         return len(self.keys)
 
     def __getitem__(self, idx: int) -> dict:
-        entry = self.store.get(self.keys[idx])
+        # Decoder needs only these three — skip esm_emb (biggest array) so its
+        # shards are never opened during decoder training.
+        entry = self.store.get(self.keys[idx], arrays=("msa_emb", "msa_tokens", "weights"))
 
         tokens_all = torch.from_numpy(entry["msa_tokens"].astype(np.int64))   # (N, L)
         weights_all = torch.from_numpy(entry["weights"].astype(np.float32))   # (N,)
@@ -107,7 +109,8 @@ class LatentFMDataset(Dataset):
         return len(self.keys)
 
     def __getitem__(self, idx: int) -> dict:
-        entry = self.store.get(self.keys[idx])
+        # Latent FM needs only the two embeddings — skip tokens/weights shards.
+        entry = self.store.get(self.keys[idx], arrays=("msa_emb", "esm_emb"))
 
         L = min(entry["seq_len"], self.max_len)
         msa_emb = torch.from_numpy(entry["msa_emb"].astype(np.float32))[:L]   # (L, 128)

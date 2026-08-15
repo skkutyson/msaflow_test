@@ -243,26 +243,32 @@ class ShardStore:
             self._mm[key] = mm
         return mm
 
-    def get(self, id: str) -> dict:
+    def get(self, id: str, arrays=None) -> dict:
+        """Fetch one protein. `arrays` selects which arrays to read (default all).
+
+        Passing only what a dataset needs avoids opening/mmapping shards for
+        unused arrays — e.g. the decoder never reads esm_emb (the largest array,
+        with the most shards), so it should pass arrays without "esm_emb".
+        """
+        want = set(ARRAYS) if arrays is None else set(arrays)
         i = self._pos[id]
         shard = int(self._col["shard"][i])
         L = int(self._col["L"][i])
         N = int(self._col["N"][i])
-        emb_row = int(self._col["emb_row"][i])
-        tok_off = int(self._col["tok_off"][i])
-        wt_off = int(self._col["wt_off"][i])
 
-        d_msa = ARRAYS["msa_emb"][1]
-        d_esm = ARRAYS["esm_emb"][1]
-        msa_emb = self._memmap("msa_emb", shard)[emb_row * d_msa:(emb_row + L) * d_msa].reshape(L, d_msa)
-        esm_emb = self._memmap("esm_emb", shard)[emb_row * d_esm:(emb_row + L) * d_esm].reshape(L, d_esm)
-        tokens = self._memmap("msa_tokens", shard)[tok_off:tok_off + N * L].reshape(N, L)
-        weights = self._memmap("weights", shard)[wt_off:wt_off + N]
-        return {
-            "msa_emb": msa_emb,
-            "esm_emb": esm_emb,
-            "msa_tokens": tokens,
-            "weights": weights,
-            "seq_len": L,
-            "query_seq": None,
-        }
+        out = {"seq_len": L, "query_seq": None}
+        if "msa_emb" in want:
+            d = ARRAYS["msa_emb"][1]
+            r = int(self._col["emb_row"][i])
+            out["msa_emb"] = self._memmap("msa_emb", shard)[r * d:(r + L) * d].reshape(L, d)
+        if "esm_emb" in want:
+            d = ARRAYS["esm_emb"][1]
+            r = int(self._col["emb_row"][i])
+            out["esm_emb"] = self._memmap("esm_emb", shard)[r * d:(r + L) * d].reshape(L, d)
+        if "msa_tokens" in want:
+            off = int(self._col["tok_off"][i])
+            out["msa_tokens"] = self._memmap("msa_tokens", shard)[off:off + N * L].reshape(N, L)
+        if "weights" in want:
+            off = int(self._col["wt_off"][i])
+            out["weights"] = self._memmap("weights", shard)[off:off + N]
+        return out
