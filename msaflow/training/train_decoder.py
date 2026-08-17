@@ -466,6 +466,20 @@ def train(cfg):
     if accelerator.is_main_process:
         logger.info("Dataset loaded  ----- %d entries", len(dataset))
 
+    # Held-out split from the train store (data.val_split_n): the first N entries
+    # become the validation set and are excluded from training. Store order is
+    # fixed, so the split is identical across ranks and runs. Takes precedence
+    # over data.val_store_path.
+    val_split_n = int(cfg.data.get("val_split_n", 0) or 0)
+    full_dataset = dataset
+    if val_split_n > 0:
+        from torch.utils.data import Subset
+        val_split_n = min(val_split_n, len(full_dataset) - 1)
+        dataset = Subset(full_dataset, list(range(val_split_n, len(full_dataset))))
+        if accelerator.is_main_process:
+            logger.info("Val split: first %d entries held out — %d remain for training",
+                        val_split_n, len(dataset))
+
     # Overfit / sanity-check mode: restrict to a tiny fixed subset.
     # If the model cannot overfit N=16 MSAs after 500 epochs, the training
     # pipeline has a fundamental bug (wrong loss sign, bad normalisation, etc.).
@@ -592,7 +606,13 @@ def train(cfg):
     if val_every > 0 and accelerator.is_main_process:
         K = cfg.training.get("val_proteins", 16)
         val_store_path = cfg.data.get("val_store_path", None)
-        if val_store_path and not (Path(val_store_path) / "meta.json").is_file():
+        if val_split_n > 0:
+            from torch.utils.data import Subset
+            val_ds = Subset(full_dataset, list(range(val_split_n)))
+            val_store_path = None
+            logger.info("Validation dataset: first %d train-store entries (held out)",
+                        len(val_ds))
+        elif val_store_path and not (Path(val_store_path) / "meta.json").is_file():
             logger.warning("val_store_path %s not found — validating on held-in "
                            "train proteins instead", val_store_path)
             val_store_path = None
@@ -603,7 +623,9 @@ def train(cfg):
                 max_seq_len=cfg.data.max_seq_len,
             )
             logger.info("Validation dataset: %s  (%d entries)", val_store_path, len(val_ds))
-        else:
+        elif val_split_n <= 0:
+            # No val store and no split: fall back to held-IN train proteins
+            # (still trained on — fit monitoring only, not generalization).
             val_ds = dataset.dataset if hasattr(dataset, "dataset") else dataset
         n_total = len(val_ds)
         rng = np.random.default_rng(seed=cfg.training.seed)

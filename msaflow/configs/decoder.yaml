@@ -12,7 +12,8 @@ model:
 
 data:
   store_path: /gpfs/deepfold/users/yjlee4/msaflow_merged
-  val_store_path: /gpfs/deepfold/users/yjlee4/msaflow_fold
+  val_store_path: /gpfs/deepfold/users/yjlee4/msaflow_fold  # ignored while val_split_n > 0
+  val_split_n: 200        # hold out first N train-store entries as the val set (0 = off)
   n_seqs_per_msa: 32      # Sequences sampled per MSA (paper: 32)
   max_seq_len: 1024
   batch_size: 1           # Per-GPU batch (number of MSAs) — reduced from 4 to avoid OOM
@@ -36,7 +37,8 @@ training:
   wandb_project: msaflow
   wandb_run_name: decoder
   val_every: 1          # validate every N epochs (0 = disabled)
-  val_proteins: 1000    # number of proteins to sample from val_store for validation
+  val_proteins: 200     # number of proteins to sample from val_store for validation
+                        # (val runs on rank 0 only — raise after timing an epoch)
   val_ode_steps: 100    # Euler steps for ODE integration (paper: Δt=0.01 = 100 steps)
   val_example_proteins: 3   # proteins to write sequence examples for (0 = disabled)
   val_example_seqs: 5       # generated sequences per protein in examples
