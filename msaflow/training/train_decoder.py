@@ -30,7 +30,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from accelerate import Accelerator
-from accelerate.utils import set_seed, DataLoaderConfiguration
+from accelerate.utils import set_seed, DataLoaderConfiguration, gather_object
 from omegaconf import OmegaConf
 
 import numpy as np
@@ -208,13 +208,16 @@ def validate_loss(
     alpha: float,
     t_max_eps: float = 0.01,
     n_draws: int = 8,
-) -> float:
+) -> tuple:
     """Teacher-forced α-Flow loss on the validation batches (same objective as train).
 
     flow_loss samples t / x0 / x1 stochastically, so a single call is noisy. We
     average `n_draws` draws per batch (and across batches, Neff-weighted like the
     train loss) to get a stable per-epoch scalar comparable to the train curve.
     Model must already be in eval(); caller restores train() afterwards.
+
+    Returns (loss_sum, n_draws_total) so per-rank shard results can be combined
+    into a correctly weighted mean; divide sum by count for the scalar loss.
     """
     device = next(model.parameters()).device
     total, count = 0.0, 0
@@ -239,7 +242,7 @@ def validate_loss(
                 t_max_eps=t_max_eps,
             ).item()
             count += 1
-    return total / max(1, count)
+    return total, count
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -603,18 +606,23 @@ def train(cfg):
     # ── Validation proteins (K fixed proteins, selected once at training start) ──
     val_every = cfg.training.get("val_every", 0)
     val_items = []
-    if val_every > 0 and accelerator.is_main_process:
+    # Loaded on ALL ranks (same seed → identical protein selection) so the
+    # epoch-end validation can be sharded across ranks instead of running
+    # entirely on rank 0, which risks exceeding the NCCL collective timeout.
+    if val_every > 0:
         K = cfg.training.get("val_proteins", 16)
         val_store_path = cfg.data.get("val_store_path", None)
         if val_split_n > 0:
             from torch.utils.data import Subset
             val_ds = Subset(full_dataset, list(range(val_split_n)))
             val_store_path = None
-            logger.info("Validation dataset: first %d train-store entries (held out)",
-                        len(val_ds))
+            if accelerator.is_main_process:
+                logger.info("Validation dataset: first %d train-store entries (held out)",
+                            len(val_ds))
         elif val_store_path and not (Path(val_store_path) / "meta.json").is_file():
-            logger.warning("val_store_path %s not found — validating on held-in "
-                           "train proteins instead", val_store_path)
+            if accelerator.is_main_process:
+                logger.warning("val_store_path %s not found — validating on held-in "
+                               "train proteins instead", val_store_path)
             val_store_path = None
         if val_store_path:
             val_ds = MSADecoderDataset(
@@ -622,7 +630,8 @@ def train(cfg):
                 n_seqs_per_msa=cfg.data.n_seqs_per_msa,
                 max_seq_len=cfg.data.max_seq_len,
             )
-            logger.info("Validation dataset: %s  (%d entries)", val_store_path, len(val_ds))
+            if accelerator.is_main_process:
+                logger.info("Validation dataset: %s  (%d entries)", val_store_path, len(val_ds))
         elif val_split_n <= 0:
             # No val store and no split: fall back to held-IN train proteins
             # (still trained on — fit monitoring only, not generalization).
@@ -638,15 +647,16 @@ def train(cfg):
                 "tokens":  raw["tokens"],
                 "weights": raw.get("weights"),
             })
-        logger.info("Validation: %d proteins selected from %s (indices %s...)",
-                    len(val_items),
-                    val_store_path or "train dataset",
-                    val_indices[:4])
+        if accelerator.is_main_process:
+            logger.info("Validation: %d proteins selected from %s (indices %s...)",
+                        len(val_items),
+                        val_store_path or "train dataset",
+                        val_indices[:4])
 
     # Ensure all ranks are in sync before entering the training loop.
-    # Rank 0 may have spent time loading the validation dataset above;
-    # without this barrier the other ranks enter the DataLoader iterator first
-    # and hang in synchronize_rng_states (BROADCAST) waiting for rank 0.
+    # Ranks may finish loading the validation dataset above at different
+    # times; without this barrier the faster ranks enter the DataLoader
+    # iterator first and hang in synchronize_rng_states (BROADCAST).
     accelerator.wait_for_everyone()
 
     # ── Training loop ─────────────────────────────────────────────────────────
@@ -722,8 +732,13 @@ def train(cfg):
                         "train/batch_idx": batch_idx,
                     }, step=global_step)
 
-        # ── Validation ───────────────────────────────────────────────────────
-        if val_every > 0 and (epoch + 1) % val_every == 0 and accelerator.is_main_process:
+        # ── Validation (sharded across ranks) ────────────────────────────────
+        if val_every > 0 and (epoch + 1) % val_every == 0:
+            # Each rank validates a strided shard of the fixed val proteins so
+            # no single rank stalls past the NCCL timeout while the others
+            # wait in the next epoch's RNG-sync broadcast. Results are
+            # gathered and aggregated on rank 0 for logging.
+            my_items = val_items[accelerator.process_index::accelerator.num_processes]
             per_protein = [
                 validate_generation(
                     _unwrap_model(model),
@@ -734,20 +749,29 @@ def train(cfg):
                     step_fn=step_fn,
                     decode_fn=decode_fn,
                 )
-                for vb in val_items
+                for vb in my_items
             ]
-            if per_protein:
+            # Teacher-forced flow-matching loss on val — directly comparable
+            # to the train loss curve (same objective, no generation).
+            loss_sum, loss_count = validate_loss(
+                _unwrap_model(model), my_items,
+                vocab_size=cfg.model.vocab_size, alpha=alpha,
+                t_max_eps=cfg.training.get("t_max_eps", 0.01),
+            )
+            shard = {"per_protein": per_protein,
+                     "loss_sum": loss_sum, "loss_count": loss_count}
+            shards = gather_object([shard]) if accelerator.num_processes > 1 else [shard]
+
+            if accelerator.is_main_process:
+                per_protein = [m for s in shards for m in s["per_protein"]]
+            if accelerator.is_main_process and per_protein:
                 val_metrics = {
                     k: float(np.mean([m[k] for m in per_protein]))
                     for k in per_protein[0]
                 }
-                # Teacher-forced flow-matching loss on val — directly comparable
-                # to the train loss curve (same objective, no generation).
-                val_metrics["val/loss"] = validate_loss(
-                    _unwrap_model(model), val_items,
-                    vocab_size=cfg.model.vocab_size, alpha=alpha,
-                    t_max_eps=cfg.training.get("t_max_eps", 0.01),
-                )
+                loss_sum = sum(s["loss_sum"] for s in shards)
+                loss_count = sum(s["loss_count"] for s in shards)
+                val_metrics["val/loss"] = loss_sum / max(1, loss_count)
                 t05 = "val/t05"
                 logger.info(
                     "Epoch %d val (%d proteins) | loss=%.4f | t=0 recovery=%.3f gap=%.3f kl=%.4f"
@@ -767,10 +791,10 @@ def train(cfg):
                     import wandb
                     wandb.log(val_metrics, step=global_step)
 
-            # ── Save sequence examples ────────────────────────────────────────
+            # ── Save sequence examples (rank 0 only — writes a file) ─────────
             n_ex_proteins = cfg.training.get("val_example_proteins", 3)
             n_ex_seqs     = cfg.training.get("val_example_seqs", 5)
-            if n_ex_proteins > 0 and val_items:
+            if accelerator.is_main_process and n_ex_proteins > 0 and val_items:
                 save_val_examples(
                     _unwrap_model(model),
                     val_items,
