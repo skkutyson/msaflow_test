@@ -212,8 +212,9 @@ def validate_loss(
     """Teacher-forced α-Flow loss on the validation batches (same objective as train).
 
     flow_loss samples t / x0 / x1 stochastically, so a single call is noisy. We
-    average `n_draws` draws per batch (and across batches, Neff-weighted like the
-    train loss) to get a stable per-epoch scalar comparable to the train curve.
+    average `n_draws` draws per batch (equal-weighted, matching the train loss —
+    Neff affects sampling only) to get a stable per-epoch scalar comparable to
+    the train curve.
     Model must already be in eval(); caller restores train() afterwards.
 
     Returns (loss_sum, n_draws_total) so per-rank shard results can be combined
@@ -224,9 +225,6 @@ def validate_loss(
     for vb in val_items:
         tokens = vb["tokens"].to(device)
         msa_emb = vb["msa_emb"].to(device)
-        weights = vb.get("weights")
-        if weights is not None:
-            weights = weights.to(device)
         seq_lengths = vb.get("seq_lengths")
         if seq_lengths is not None:
             seq_lengths = seq_lengths.to(device)
@@ -238,7 +236,7 @@ def validate_loss(
             total += flow_loss(
                 model, tokens, msa_emb,
                 vocab_size=vocab_size, alpha=alpha,
-                weights=weights, padding_mask=padding_mask,
+                weights=None, padding_mask=padding_mask,
                 t_max_eps=t_max_eps,
             ).item()
             count += 1
@@ -672,8 +670,10 @@ def train(cfg):
             with accelerator.accumulate(model):
                 msa_emb     = batch["msa_emb"]      # (B_flat, L, 128)
                 tokens      = batch["tokens"]       # (B_flat, L)
-                weights     = batch["weights"]      # (B_flat,)
                 seq_lengths = batch["seq_lengths"]  # (B_flat,)
+                # Neff reweighting is applied at *sampling* time only (dataset
+                # draws the 32 seqs ∝ w_i); the loss itself is equal-weighted to
+                # avoid double-counting w (which would optimise a ∝ w² target).
 
                 # Build position mask: True at real residues, False at padding.
                 # With batch_size=1 all sequences have the same L so this is all-True.
@@ -692,7 +692,7 @@ def train(cfg):
                     msa_emb,
                     vocab_size=cfg.model.vocab_size,
                     alpha=alpha,
-                    weights=weights,
+                    weights=None,   # equal-weighted; Neff only via sampling
                     padding_mask=padding_mask,
                     t_max_eps=cfg.training.get("t_max_eps", 0.01),
                 )
@@ -714,23 +714,29 @@ def train(cfg):
             epoch_loss += loss.detach().float()
 
             # ── Logging ──────────────────────────────────────────────────────
-            if global_step % cfg.training.log_every == 0 and accelerator.is_main_process:
-                lr = scheduler.get_last_lr()[0]
-                logger.info(
-                    "epoch %d | step %d | loss %.4f | lr %.2e",
-                    epoch, global_step, loss.item(), lr,
-                )
-                _log_metrics({"kind": "train", "step": global_step, "epoch": epoch,
-                              "loss": loss.item(), "lr": lr})
-                if use_wandb:
-                    import wandb
-                    wandb.log({
-                        "train/loss": loss.item(),
-                        "train/lr": lr,
-                        "train/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
-                        "train/epoch": epoch,
-                        "train/batch_idx": batch_idx,
-                    }, step=global_step)
+            if global_step % cfg.training.log_every == 0:
+                # Equal-mean the loss across all ranks so the logged curve
+                # reflects the whole DDP step, not just rank 0's micro-batch.
+                # reduce() is a collective — it MUST run on every rank, hence it
+                # sits outside the is_main_process guard (else NCCL deadlock).
+                loss_avg = accelerator.reduce(loss.detach(), reduction="mean").item()
+                if accelerator.is_main_process:
+                    lr = scheduler.get_last_lr()[0]
+                    logger.info(
+                        "epoch %d | step %d | loss %.4f | lr %.2e",
+                        epoch, global_step, loss_avg, lr,
+                    )
+                    _log_metrics({"kind": "train", "step": global_step, "epoch": epoch,
+                                  "loss": loss_avg, "lr": lr})
+                    if use_wandb:
+                        import wandb
+                        wandb.log({
+                            "train/loss": loss_avg,
+                            "train/lr": lr,
+                            "train/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
+                            "train/epoch": epoch,
+                            "train/batch_idx": batch_idx,
+                        }, step=global_step)
 
         # ── Validation (sharded across ranks) ────────────────────────────────
         if val_every > 0 and (epoch + 1) % val_every == 0:
@@ -810,6 +816,13 @@ def train(cfg):
                 )
             model.train()
 
+        # Equal-weighted mean epoch loss across all ranks (collective — every
+        # rank must call reduce(), so compute it before the is_main_process block).
+        if not torch.is_tensor(epoch_loss):
+            epoch_loss = torch.tensor(float(epoch_loss), device=accelerator.device)
+        epoch_loss_avg = (accelerator.reduce(epoch_loss, reduction="mean")
+                          / max(1, len(loader))).item()
+
         # ── Checkpoint ───────────────────────────────────────────────────────
         if accelerator.is_main_process:
             unwrapped = _unwrap_model(model)
@@ -834,7 +847,7 @@ def train(cfg):
             is_last = (epoch == cfg.training.epochs - 1)
             if (epoch + 1) % save_every == 0 or is_last:
                 torch.save(ckpt, output_dir / f"epoch_{epoch:03d}.pt")
-            avg_loss = epoch_loss.item() / len(loader)
+            avg_loss = epoch_loss_avg
             logger.info(
                 "Epoch %d complete | avg loss %.4f",
                 epoch,
