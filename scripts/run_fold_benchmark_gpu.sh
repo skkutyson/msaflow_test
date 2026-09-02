@@ -41,10 +41,16 @@ TARGETS=${TARGETS:-"8ux2-assembly1__A 8oxk-assembly1__A 8eb9-assembly1__A"}
 
 # ── 실행 파라미터 ─────────────────────────────────────────────────────────────
 GPU_ID=${GPU_ID:-0}
-N_SEQS=${N_SEQS:-32}          # sequences per synthetic seed
-N_SEEDS=${N_SEEDS:-5}         # synthetic seeds (n_syn_seeds)
+N_SEQS=${N_SEQS:-32}          # sequences per synthetic seed (augmentation)
+N_SEEDS=${N_SEEDS:-5}         # synthetic seeds for augmentation (n_syn_seeds)
 N_STEPS=${N_STEPS:-100}       # ODE steps
 TEMPERATURE=${TEMPERATURE:-0.5}
+
+# ── Protenix 폴딩 샘플링: N_FOLD_SEEDS seed × N_SAMPLE sample (기본 5×5=25) ────
+N_FOLD_SEEDS=${N_FOLD_SEEDS:-5}   # Protenix 폴딩 seed 개수 (증강 N_SEEDS 와 별개)
+FOLD_SEED_BASE=${FOLD_SEED_BASE:-101}
+N_SAMPLE=${N_SAMPLE:-5}           # seed 당 diffusion 샘플 수
+FOLD_SEEDS=$(seq -s, "$FOLD_SEED_BASE" $((FOLD_SEED_BASE + N_FOLD_SEEDS - 1)))
 PROTENIX_MODEL=${PROTENIX_MODEL:-protenix_base_default_v1.0.0}
 PROTENIX_CKPT=${PROTENIX_CKPT:-/home/yjlee4/MSA_FLOW/checkpoints/checkpoints/protenix_base_default_v1.0.0.pt}   # 있으면 Rec 트랙 활성화
 TMSCORE_BIN=${TMSCORE_BIN:-TMscore}
@@ -141,6 +147,7 @@ echo " Output dir    : $OUTPUT_DIR"
 echo " Protenix model: $PROTENIX_MODEL"
 echo " Rec track     : $([ -n "$PROTENIX_CKPT" ] && echo "ON ($PROTENIX_CKPT)" || echo "OFF (Syn track only)")"
 echo " n_seqs=$N_SEQS  n_syn_seeds=$N_SEEDS  n_steps=$N_STEPS  temperature=$TEMPERATURE"
+echo " Fold sampling : ${N_FOLD_SEEDS} seeds ($FOLD_SEEDS) x ${N_SAMPLE} samples = $((N_FOLD_SEEDS * N_SAMPLE))/target"
 echo " Started       : $(date)"
 echo "============================================================"
 
@@ -164,6 +171,8 @@ python "$REPO_DIR/msaflow/inference/fold_benchmark.py" \
     --n_steps         "$N_STEPS" \
     --temperature     "$TEMPERATURE" \
     --protenix_model  "$PROTENIX_MODEL" \
+    --fold_seeds      "$FOLD_SEEDS" \
+    --n_sample        "$N_SAMPLE" \
     --tmscore_bin     "$TMSCORE_BIN" \
     $PROTENIX_CKPT_ARG \
     $REF_ARG \

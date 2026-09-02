@@ -156,6 +156,8 @@ def run_protenix(
     model_name: str = "protenix_base_default_v1.0.0",
     protenix_dir: Optional[str] = None,
     use_msa: bool = True,
+    seeds: str = "101",
+    n_sample: int = 5,
 ) -> subprocess.CompletedProcess:
     """Invoke `protenix pred` as a subprocess.
 
@@ -175,6 +177,9 @@ def run_protenix(
         "--trimul_kernel",  "torch",
         "--triatt_kernel",  "torch",
         "--use_msa",        str(use_msa),
+        # N seeds x N_sample samples/seed  (e.g. 5 seeds x 5 = 25 predictions)
+        "--seeds",                       seeds,
+        "--sample_diffusion.N_sample",   str(n_sample),
     ]
 
     # Repo root = two levels above this file (msaflow/inference/fold_benchmark.py)
@@ -354,6 +359,8 @@ def fold_once(
         output_dir=str(protenix_out_dir),
         model_name=args.protenix_model,
         use_msa=use_msa,
+        seeds=args.fold_seeds,
+        n_sample=args.n_sample,
     )
     if result.returncode != 0:
         logger.error("  Protenix failed (exit %d) for %s", result.returncode, run_name)
@@ -696,6 +703,11 @@ def main():
                         help="SDE temperature (paper: 0.5)")
     parser.add_argument("--protenix_model",  default="protenix_base_default_v1.0.0",
                         help="Protenix model name for structure prediction")
+    parser.add_argument("--fold_seeds",      default="101",
+                        help="Comma-separated Protenix folding seeds, e.g. '101,102,103,104,105' "
+                             "(N seeds x --n_sample samples). Distinct from --n_seeds (augmentation).")
+    parser.add_argument("--n_sample",        type=int, default=5,
+                        help="Protenix diffusion samples per seed (default: 5)")
     parser.add_argument("--tmscore_bin",     default="TMscore",
                         help="Path or name of TMscore binary")
     # Few-shot specific
