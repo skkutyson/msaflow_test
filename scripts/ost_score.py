@@ -171,8 +171,20 @@ def load_chain_map(chain_csv):
     return chains
 
 
-def find_gt(gt_dir, pdb_id):
-    for cand in (f"{pdb_id}.cif", f"{pdb_id}.cif.gz"):
+def split_target(name):
+    """타겟명 '8xjifdj_assembly1__A' → (gt_id='8xjifdj_assembly1', chain='A').
+
+    예측/a3m 은 chain 접미사 '__A' 를 붙이지만 GT 파일은 그게 없는
+    '{gt_id}.cif' 이다. 접미사가 없으면 chain 은 None(호출부에서 폴백).
+    """
+    if "__" in name:
+        base, chain = name.rsplit("__", 1)
+        return base, chain
+    return name, None
+
+
+def find_gt(gt_dir, gt_id):
+    for cand in (f"{gt_id}.cif", f"{gt_id}.cif.gz"):
         p = os.path.join(gt_dir, cand)
         if os.path.exists(p):
             return p
@@ -199,33 +211,36 @@ def main():
     rows = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        for pdb_id in targets:
-            gt = find_gt(args.gt_dir, pdb_id)
+        for target in targets:
+            # 타겟명의 '__A' 접미사에서 GT id 와 chain 을 분리
+            gt_id, chain_from_name = split_target(target)
+            chain = chain_from_name or chain_map.get(target) or chain_map.get(gt_id) or "A"
+
+            gt = find_gt(args.gt_dir, gt_id)
             if gt is None:
-                sys.stderr.write(f"[skip] GT 없음: {args.gt_dir}/{pdb_id}.cif\n")
+                sys.stderr.write(f"[skip] GT 없음: {args.gt_dir}/{gt_id}.cif\n")
                 continue
 
-            chain = chain_map.get(pdb_id, "A")
             # 기본: GT 어셈블리에서 대상 chain 만 떼어 단일-체인 레퍼런스로 채점
             if not args.score_full_complex:
-                ref_single = os.path.join(tmpdir, f"{pdb_id}_chain{chain}.cif")
+                ref_single = os.path.join(tmpdir, f"{gt_id}_chain{chain}.cif")
                 extracted = extract_ref_chain(gt, chain, ref_single)
                 if extracted is None:
                     sys.stderr.write(
-                        f"[warn] {pdb_id}: GT 에 chain '{chain}' 없음 → 어셈블리 전체로 비교\n")
+                        f"[warn] {target}: GT 에 chain '{chain}' 없음 → 어셈블리 전체로 비교\n")
                 else:
                     gt = extracted
 
-            preds = enumerate_predictions(args.pred_root, pdb_id)
+            preds = enumerate_predictions(args.pred_root, target)
             if not preds:
-                sys.stderr.write(f"[skip] 예측 CIF 없음: {pdb_id}\n")
+                sys.stderr.write(f"[skip] 예측 CIF 없음: {target}\n")
                 continue
 
             for cif, seed, sample, rank_score in preds:
                 lddt, tm, gdt, rmsd = run_ost(ost_cmd, cif, gt, tmpdir)
                 rows.append({
-                    "pdb_id": pdb_id,
-                    "chain_id": chain_map.get(pdb_id, "A"),
+                    "pdb_id": gt_id,
+                    "chain_id": chain,
                     "seed": seed,
                     "sample": sample,
                     "ranking_score": rank_score,
