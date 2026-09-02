@@ -39,12 +39,13 @@ CSV_FIELDS = [
 def resolve_ost_cmd():
     env_cmd = os.environ.get("OST_CMD", "").strip()
     if env_cmd:
-        return env_cmd.split()
+        # ~ 는 셸이 아니라 여기서 확장(따옴표 안에 있으면 미확장 상태로 넘어옴)
+        return [os.path.expanduser(tok) for tok in env_cmd.split()]
     if shutil.which("compare-structures"):
         return ["compare-structures"]
     if shutil.which("ost"):
         return ["ost", "compare-structures"]
-    sif = os.environ.get("OST_SIF", "").strip()
+    sif = os.path.expanduser(os.environ.get("OST_SIF", "").strip())
     if sif:
         runner = shutil.which("apptainer") or shutil.which("singularity")
         if runner:
@@ -253,7 +254,7 @@ def main():
                     "mode": args.mode,
                 })
                 sys.stderr.write(
-                    f"  {pdb_id} seed={seed} sample={sample}  "
+                    f"  {gt_id} chain={chain} seed={seed} sample={sample}  "
                     f"lddt={lddt} tm={tm} gdt_ts={gdt} rmsd={rmsd}\n"
                 )
 
