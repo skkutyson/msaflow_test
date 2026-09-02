@@ -88,34 +88,40 @@ if [ ! -f "$CKPT_EXPECTED" ] && [ -f "$CKPT_ACTUAL" ]; then
     echo "Linked Protenix checkpoint: $CKPT_EXPECTED -> $CKPT_ACTUAL"
 fi
 
-# ── 3개 타겟만 담은 fasta 생성 (a3m query = fasta query 로 확인됨) ────────────
+# ── 3개 타겟 subset fasta 생성 — query 서열을 각 a3m 첫 서열에서 직접 추출 ────
+# (원본 foldbench_monomer.fasta 불필요. a3m 첫 record = query 이므로 그걸로 --fasta 구성)
 mkdir -p "$OUTPUT_DIR"
 FASTA_SUBSET="$OUTPUT_DIR/targets_subset.fasta"
-python - "$REPO_DIR/foldbench_monomer.fasta" "$FASTA_SUBSET" "$SHALLOW_MSA_DIR" "$TARGETS" << 'PYEOF'
+python - "$FASTA_SUBSET" "$SHALLOW_MSA_DIR" "$TARGETS" << 'PYEOF'
 import sys, os
-src, dst, msa_dir, targets_str = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-records, name, seq = [], None, []
-with open(src) as fh:
-    for line in fh:
-        line = line.rstrip("\n")
-        if line.startswith(">"):
-            if name is not None: records.append((name, "".join(seq)))
-            name, seq = line[1:].strip().split()[0], []
-        elif line: seq.append(line)
-    if name is not None: records.append((name, "".join(seq)))
-by_name = {n: s for n, s in records}
+dst, msa_dir, targets_str = sys.argv[1], sys.argv[2], sys.argv[3]
 wanted = targets_str.split()
 
-missing = [t for t in wanted if t not in by_name]
-if missing:
-    sys.exit(f"ERROR: fasta에 없는 타겟: {missing}")
+def read_a3m_query(path):
+    """a3m 첫 record 의 서열 = query. 삽입(소문자)·gap 제거해 정규 서열 반환."""
+    seq = []
+    with open(path) as fh:
+        first = fh.readline()
+        if not first.startswith(">"):
+            sys.exit(f"ERROR: a3m 형식 아님(첫 줄 '>' 아님): {path}")
+        for line in fh:
+            if line.startswith(">"):
+                break
+            seq.append(line.strip())
+    q = "".join(seq).replace("-", "").replace(".", "").upper()
+    if not q:
+        sys.exit(f"ERROR: a3m query 서열 비어있음: {path}")
+    return q
+
 no_a3m = [t for t in wanted if not os.path.exists(os.path.join(msa_dir, f"{t}.a3m"))]
 if no_a3m:
     sys.exit(f"ERROR: 입력 a3m 없음 ({msa_dir}): {no_a3m}")
 
 with open(dst, "w") as out:
     for t in wanted:
-        out.write(f">{t}\n{by_name[t]}\n")
+        q = read_a3m_query(os.path.join(msa_dir, f"{t}.a3m"))
+        out.write(f">{t}\n{q}\n")
+        print(f"  {t}: query L={len(q)} (from a3m)")
 print("Targets:", ", ".join(wanted))
 PYEOF
 
