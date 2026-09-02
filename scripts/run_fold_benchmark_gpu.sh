@@ -46,9 +46,9 @@ N_SEEDS=${N_SEEDS:-5}         # synthetic seeds (n_syn_seeds)
 N_STEPS=${N_STEPS:-100}       # ODE steps
 TEMPERATURE=${TEMPERATURE:-0.5}
 PROTENIX_MODEL=${PROTENIX_MODEL:-protenix_base_default_v1.0.0}
-PROTENIX_CKPT=${PROTENIX_CKPT:-}   # 있으면 Rec 트랙 활성화
+PROTENIX_CKPT=${PROTENIX_CKPT:-/home/yjlee4/MSA_FLOW/checkpoints/checkpoints/protenix_base_default_v1.0.0.pt}   # 있으면 Rec 트랙 활성화
 TMSCORE_BIN=${TMSCORE_BIN:-TMscore}
-REF_PDB_DIR=${REF_PDB_DIR:-}       # 참조 PDB 있으면 fold_benchmark 자체 TM-score 계산
+REF_PDB_DIR=${REF_PDB_DIR:-}        # 참조 PDB 있으면 fold_benchmark 자체 TM-score 계산
 
 # ── OST 채점 (folding 이후 GT 비교) ───────────────────────────────────────────
 RUN_OST=${RUN_OST:-1}              # 0 이면 OST 채점 건너뜀
