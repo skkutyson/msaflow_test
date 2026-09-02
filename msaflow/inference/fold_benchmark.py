@@ -178,8 +178,10 @@ def run_protenix(
         "--triatt_kernel",  "torch",
         "--use_msa",        str(use_msa),
         # N seeds x N_sample samples/seed  (e.g. 5 seeds x 5 = 25 predictions)
-        "--seeds",                       seeds,
-        "--sample_diffusion.N_sample",   str(n_sample),
+        # NB: `protenix pred` CLI uses -e/--sample (not --sample_diffusion.N_sample,
+        # which is the runner/inference.py config-override form).
+        "--seeds",   seeds,
+        "--sample",  str(n_sample),
     ]
 
     # Repo root = two levels above this file (msaflow/inference/fold_benchmark.py)
