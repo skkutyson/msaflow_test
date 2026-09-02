@@ -31,13 +31,13 @@ set -euo pipefail
 
 # ── 경로 ──────────────────────────────────────────────────────────────────────
 REPO_DIR=${REPO_DIR:-/home/yjlee4/MSA_FLOW}
-DECODER_CKPT=${DECODER_CKPT:-/gpfs/deepfold/users/yjlee4/decoder/decoder_ema_final.pt}
-LATENT_FM_CKPT=${LATENT_FM_CKPT:-/gpfs/deepfold/users/yjlee4/latent_fm_foldbench/latent_fm_ema_final.pt}
-SHALLOW_MSA_DIR=${SHALLOW_MSA_DIR:-/home/yjlee4/a3m_output}
+DECODER_CKPT=${DECODER_CKPT:-/home/yjlee4/MSA_FLOW/runs/decoder/latest.pt}
+LATENT_FM_CKPT=${LATENT_FM_CKPT:-/home/yjlee4/MSA_FLOW/runs/latent_fm/latest.pt}
+SHALLOW_MSA_DIR=${SHALLOW_MSA_DIR:-/store/deepfold3/results/msa/a3m}
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO_DIR/runs/fold_benchmark_fewshot_gpu}
 
 # ── 타겟 (기본: monomer 앞 3개) ───────────────────────────────────────────────
-TARGETS=${TARGETS:-"7pv5-assembly1 7qp5-assembly1 7qsj-assembly1"}
+TARGETS=${TARGETS:-"8ux2-assembly1__A 8oxk-assembly1__A 8eb9-assembly1__A"}
 
 # ── 실행 파라미터 ─────────────────────────────────────────────────────────────
 GPU_ID=${GPU_ID:-0}
