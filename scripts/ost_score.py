@@ -20,7 +20,6 @@ OST 실행 경로는 아래 순서로 자동 탐지 (OST_CMD 로 강제 지정 �
 import argparse
 import csv
 import glob
-import gzip
 import json
 import os
 import re
@@ -78,14 +77,29 @@ def deep_get(obj, key):
     return None
 
 
-def maybe_gunzip(path, tmpdir):
-    """GT 가 .cif.gz 면 임시 .cif 로 풀어서 경로 반환."""
-    if path.endswith(".gz"):
-        dst = os.path.join(tmpdir, os.path.basename(path)[:-3])
-        with gzip.open(path, "rb") as fi, open(dst, "wb") as fo:
-            shutil.copyfileobj(fi, fo)
-        return dst
-    return path
+def extract_ref_chain(gt_path, chain_id, out_path):
+    """GT(어셈블리, .cif/.cif.gz)에서 지정 chain 만 떼어 단일-체인 mmCIF 로 저장.
+
+    예측이 chain A 단량체이므로, 복합체 전체와 비교하면 사슬간(A-B) contact 를
+    예측이 재현 못 한 것으로 lDDT 가 깎인다. chain A 만 남긴 레퍼런스로 비교해야
+    순수 monomer 채점이 된다. chain 을 못 찾으면 None 반환(호출부에서 폴백/스킵).
+    """
+    import gemmi  # venv 에 존재 (0.6.x)
+    st = gemmi.read_structure(gt_path)  # .gz 자동 처리
+    if len(st) == 0:
+        return None
+    while len(st) > 1:          # 첫 model 만 유지
+        del st[1]
+    model = st[0]
+    names = [ch.name for ch in model]
+    if chain_id not in names:
+        return None
+    for name in list(names):    # 대상 chain 외 전부 제거
+        if name != chain_id:
+            model.remove_chain(name)
+    st.setup_entities()
+    st.make_mmcif_document().write_file(out_path)
+    return out_path
 
 
 def run_ost(ost_cmd, model_cif, ref_cif, tmpdir):
@@ -173,6 +187,8 @@ def main():
     ap.add_argument("--mode", default="fewshot", help="zeroshot|fewshot|nomsa|shallow")
     ap.add_argument("--targets", required=True, help="공백 구분 pdb_id 목록")
     ap.add_argument("--chain_csv", default=None, help="pdb_id,chain_id CSV (기본 chain A)")
+    ap.add_argument("--score_full_complex", action="store_true",
+                    help="GT 어셈블리 전체와 비교(기본은 대상 chain 만 떼어 단일-체인 비교)")
     args = ap.parse_args()
 
     ost_cmd = resolve_ost_cmd()
@@ -188,7 +204,17 @@ def main():
             if gt is None:
                 sys.stderr.write(f"[skip] GT 없음: {args.gt_dir}/{pdb_id}.cif\n")
                 continue
-            gt = maybe_gunzip(gt, tmpdir)
+
+            chain = chain_map.get(pdb_id, "A")
+            # 기본: GT 어셈블리에서 대상 chain 만 떼어 단일-체인 레퍼런스로 채점
+            if not args.score_full_complex:
+                ref_single = os.path.join(tmpdir, f"{pdb_id}_chain{chain}.cif")
+                extracted = extract_ref_chain(gt, chain, ref_single)
+                if extracted is None:
+                    sys.stderr.write(
+                        f"[warn] {pdb_id}: GT 에 chain '{chain}' 없음 → 어셈블리 전체로 비교\n")
+                else:
+                    gt = extracted
 
             preds = enumerate_predictions(args.pred_root, pdb_id)
             if not preds:
