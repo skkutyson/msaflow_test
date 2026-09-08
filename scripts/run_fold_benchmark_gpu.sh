@@ -61,6 +61,9 @@ RUN_OST=${RUN_OST:-1}              # 0 이면 OST 채점 건너뜀
 GT_DIR=${GT_DIR:-/gpfs/deepfold/users/paul3875/foldbench_ground_truths/ground_truth_20250520}
 CHAIN_CSV=${CHAIN_CSV:-$REPO_DIR/monomer_protein.csv}
 OST_CSV=${OST_CSV:-$OUTPUT_DIR/monomer_protein_ost.csv}
+# 스코어러 선택: ost_score.py(기본, gemmi 로 chain 추출) 또는
+#   ost_score_chainmap.py(gemmi 미사용, compare-structures -c A:A 로 chain 매핑)
+OST_SCORER=${OST_SCORER:-ost_score.py}
 # OST 실행: OST_SIF=/path/ost.sif  또는  OST_CMD='apptainer exec /path/ost.sif ost compare-structures'
 # (없으면 ost_score.py 가 PATH 의 ost/compare-structures 자동 탐지)
 
@@ -184,7 +187,7 @@ if [ "$RUN_OST" = "1" ]; then
     if [ ! -d "$GT_DIR" ]; then
         echo "WARNING: GT_DIR 없음: $GT_DIR — OST 채점 건너뜀. GT_DIR=... 로 지정하세요." >&2
     else
-        python "$REPO_DIR/scripts/ost_score.py" \
+        python "$REPO_DIR/scripts/$OST_SCORER" \
             --pred_root "$OUTPUT_DIR/folds" \
             --gt_dir    "$GT_DIR" \
             --mode      fewshot \
