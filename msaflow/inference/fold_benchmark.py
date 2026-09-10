@@ -625,6 +625,8 @@ def run_benchmark(args):
 
         # ── No-MSA baseline ────────────────────────────────────────────────────
         elif mode == "nomsa":
+            # tag 를 붙여 folds/{target}_nomsa 에 저장 → ost_score 의 {target}_* glob 이
+            # 잡을 수 있게 함(다른 모드와 동일). protenix 는 --use_msa False + MSA 경로 없음.
             plddt, cif = fold_once(
                 prot_name=prot_name,
                 query_seq=query_seq,
@@ -632,7 +634,7 @@ def run_benchmark(args):
                 fold_dir=fold_dir,
                 args=args,
                 use_msa=False,
-                tag="",
+                tag="_nomsa",
             )
             logger.info("  pLDDT=%.2f", plddt)
 
