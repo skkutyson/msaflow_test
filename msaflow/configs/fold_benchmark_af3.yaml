@@ -1,0 +1,64 @@
+# ==============================================================================
+# MSAFlow Fold Benchmark — AF3(AlphaFold3) weights 프로파일
+#
+# fold_benchmark.yaml 과 파이프라인/스켈레톤은 동일하고, 폴딩 모델만 사용자가 보유한
+# AF3 계열 가중치로 교체한 프로파일이다. 나머지 섹션(targets/augment/fold/ost)의 의미는
+# fold_benchmark.yaml 과 완전히 동일하다.
+#
+# 실행:
+#     bash scripts/run_fold_benchmark_gpu.sh msaflow/configs/fold_benchmark_af3.yaml
+#
+# ── 사용 전 반드시 채울 것 (TODO) ─────────────────────────────────────────────
+#   model.protenix_model : `protenix pred -n <이 이름>` 에 넘어가는 등록된 모델명.
+#                          AF3 가중치가 이 이름에 대응해야 한다.
+#   model.protenix_ckpt  : AF3 가중치 .pt 절대경로. runner 는
+#                          $PROTENIX_ROOT_DIR/checkpoint/<protenix_model>.pt 를 찾으므로,
+#                          해당 위치에 없으면 fold_benchmark.py 가
+#                          $REPO_DIR/checkpoints/checkpoints/<protenix_model>.pt →
+#                          기대경로로 심링크한다. AF3 가중치를 그 경로에 두거나
+#                          여기 절대경로를 지정하라.
+# ==============================================================================
+
+run:
+  mode: fewshot            # zeroshot | fewshot | shallow | nomsa
+  output_dir: /home/yjlee4/MSA_FLOW/runs/fold_benchmark_af3
+  device: cuda
+  gpu_id: 0
+  resume: false            # 기본 fresh(재실행). true = 이어하기(기존 a3m/CIF 재사용)
+  regenerate: false
+  refold: false
+  num_shards: 1
+  shard_id: 0
+
+targets:
+  list: []
+  csv: /home/yjlee4/MSA_FLOW/monomer_protein.csv
+  fasta: null              # 지정 시 헤더는 'pdb_id__chain' 형식이어야 OST chain 매핑 일치
+  shallow_msa_dir: /store/deepfold3/results/msa/a3m
+
+model:
+  # TODO: 실제 AF3 가중치에 맞는 모델명/경로로 교체
+  protenix_model: af3_weights           # <-- `protenix pred -n` 에 넘어가는 등록 모델명
+  protenix_ckpt: /path/to/af3/af3_weights.pt   # <-- AF3 가중치 .pt 절대경로
+  decoder_ckpt: /home/yjlee4/MSA_FLOW/runs/decoder/latest.pt
+  latent_fm_ckpt: /home/yjlee4/MSA_FLOW/runs/latent_fm/latest.pt
+
+augment:
+  n_seqs: 32
+  n_seeds: 5
+  n_steps: 100
+  temperature: 0.5
+
+fold:
+  n_fold_seeds: 5
+  fold_seed_base: 101
+  fold_seeds: null
+  n_sample: 5
+  ref_pdb_dir: null
+  tmscore_bin: TMscore
+
+ost:
+  enable: true
+  gt_dir: /gpfs/deepfold/users/paul3875/foldbench_ground_truths/ground_truth_20250520
+  chain_csv: /home/yjlee4/MSA_FLOW/monomer_protein.csv
+  out_csv: null

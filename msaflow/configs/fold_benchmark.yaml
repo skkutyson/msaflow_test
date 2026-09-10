@@ -1,0 +1,66 @@
+# ==============================================================================
+# MSAFlow Fold Benchmark — end-to-end 설정
+#
+#   입력 a3m → MSA 증강(zeroshot/fewshot) → Protenix(AF3) 폴딩 → OST GT 채점
+#
+# 실행 (GPU 컴퓨트 노드에서):
+#     bash scripts/run_fold_benchmark_gpu.sh msaflow/configs/fold_benchmark.yaml
+#   또는 직접:
+#     python msaflow/inference/fold_benchmark.py --config msaflow/configs/fold_benchmark.yaml
+#
+# 개별 값은 CLI 플래그로 덮어쓸 수 있음 (예: --mode zeroshot --n_sample 3).
+# ==============================================================================
+
+run:
+  mode: fewshot            # zeroshot | fewshot | shallow | nomsa
+  output_dir: /home/yjlee4/MSA_FLOW/runs/fold_benchmark_fewshot_gpu
+  device: cuda
+  gpu_id: 0                # CUDA_VISIBLE_DEVICES 로 노출할 GPU 인덱스
+  # 기본(resume: false) = fresh: 이전 출력이 있어도 증강·폴딩을 다시 수행(덮어씀).
+  # 큰 배치를 이어서 돌릴 때만 true 로 두면 기존 a3m/CIF 를 재사용하고 없는 것만 수행.
+  resume: false
+  regenerate: false        # resume 중에도 a3m 을 강제 재생성하고 싶을 때만 true
+  refold: false            # resume 중에도 CIF 를 강제 재폴딩하고 싶을 때만 true
+  # 병렬 샤딩(선택): num_shards 개로 나눠 shard_id 만 처리
+  num_shards: 1
+  shard_id: 0
+
+targets:
+  # (택1) 직접 나열 — 채우면 csv 보다 우선. 예: ["8ux2-assembly1__A", "8oxk-assembly1__A"]
+  list: []
+  # (택1) CSV 에서 (pdb_id,chain_id → pdb_id__chain_id). 전체 타겟 돌릴 때 이것 사용.
+  csv: /home/yjlee4/MSA_FLOW/monomer_protein.csv
+  # 이미 준비된 FASTA 가 있으면 지정(있으면 list/csv 무시). 없으면 아래 a3m 에서 query 추출.
+  # 주의: OST 채점이 헤더에서 chain 을 뽑으므로 헤더는 반드시 'pdb_id__chain' 형식이어야
+  #       a3m 경로와 동일한 chain 매핑(-c A:A)이 적용된다. (예: >8ux2-assembly1__A)
+  fasta: null
+  # 입력 shallow a3m 디렉토리({target}.a3m). fewshot/shallow 의 입력이자 query 서열 출처.
+  # a3m 이 없는 타겟은 자동 skip(abort 아님).
+  shallow_msa_dir: /store/deepfold3/results/msa/a3m
+
+model:
+  protenix_model: protenix_base_default_v1.0.0
+  # Rec 트랙(shallow MSA 임베딩) 활성화용. null 이면 fewshot 은 Syn 트랙만.
+  protenix_ckpt: /home/yjlee4/MSA_FLOW/checkpoints/checkpoints/protenix_base_default_v1.0.0.pt
+  decoder_ckpt: /home/yjlee4/MSA_FLOW/runs/decoder/latest.pt
+  latent_fm_ckpt: /home/yjlee4/MSA_FLOW/runs/latent_fm/latest.pt
+
+augment:                   # MSA 증강 파라미터 (zeroshot/fewshot 에서만 사용)
+  n_seqs: 32               # 합성 seed 당 생성 서열 수
+  n_seeds: 5               # 합성 seed 개수 (zeroshot: 각각 폴딩해 best pLDDT)
+  n_steps: 100             # flow-matching ODE 스텝
+  temperature: 0.5
+
+fold:                      # Protenix 폴딩 샘플링: n_fold_seeds seed × n_sample sample
+  n_fold_seeds: 5
+  fold_seed_base: 101      # seed = base, base+1, ... (총 n_fold_seeds 개)
+  fold_seeds: null         # 직접 지정 시(예: "101,102,103") 위 두 값 무시
+  n_sample: 5              # seed 당 diffusion 샘플 수
+  ref_pdb_dir: null        # 참조 PDB 있으면 fold_benchmark 자체 TM-score 계산
+  tmscore_bin: TMscore
+
+ost:                       # 폴딩 후 예측 CIF vs GT 채점 → out_csv
+  enable: true
+  gt_dir: /gpfs/deepfold/users/paul3875/foldbench_ground_truths/ground_truth_20250520
+  chain_csv: /home/yjlee4/MSA_FLOW/monomer_protein.csv
+  out_csv: null            # null → {run.output_dir}/monomer_protein_ost.csv

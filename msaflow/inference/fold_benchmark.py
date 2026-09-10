@@ -69,11 +69,13 @@ import logging
 import os
 import subprocess
 import sys
+from argparse import Namespace
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 logger = logging.getLogger(__name__)
 
@@ -679,60 +681,298 @@ def run_benchmark(args):
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Config-driven entrypoint helpers
+#
+# The benchmark is controlled by a single YAML file (see msaflow/configs/
+# fold_benchmark.yaml). Everything below turns that YAML (plus optional CLI
+# overrides) into the exact `args` Namespace that run_benchmark() consumes, so
+# the folding/scoring skeleton above is untouched — only the settings move.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _read_a3m_query(path: str) -> str:
+    """First a3m record = query. Strip insertions (lowercase)/gaps → canonical seq."""
+    seq = []
+    with open(path) as fh:
+        first = fh.readline()
+        if not first.startswith(">"):
+            raise ValueError(f"a3m 형식 아님(첫 줄 '>' 아님): {path}")
+        for line in fh:
+            if line.startswith(">"):
+                break
+            seq.append(line.strip())
+    q = "".join(seq).replace("-", "").replace(".", "").upper()
+    if not q:
+        raise ValueError(f"a3m query 서열 비어있음: {path}")
+    return q
+
+
+def resolve_target_names(targets_list, targets_csv) -> list[str]:
+    """YAML targets.list 또는 targets.csv → ['pdb_id__chain', ...] (순서보존 dedup).
+
+    CSV 는 헤더(pdb_id,chain_id) 있는 monomer_protein.csv 형식.
+    """
+    names: list[str] = []
+    if targets_list:
+        names = [str(t).strip() for t in targets_list if str(t).strip()]
+    elif targets_csv:
+        with open(targets_csv) as fh:
+            reader = csv.reader(fh)
+            next(reader, None)  # skip header (pdb_id,chain_id)
+            for row in reader:
+                if len(row) < 2 or not row[0].strip():
+                    continue
+                names.append(f"{row[0].strip()}__{row[1].strip()}")
+    seen, out = set(), []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def build_subset_fasta(target_names, shallow_msa_dir, dst) -> list[str]:
+    """각 타겟 a3m 첫 record(=query)로 subset FASTA 생성.
+
+    입력 a3m 이 없는 타겟은 abort 하지 않고 skip(경고). 실제로 기록된 타겟명만 반환하므로
+    이후 폴딩·OST 채점이 동일한 부분집합에 대해 일관되게 돈다.
+    """
+    if not shallow_msa_dir:
+        raise SystemExit(
+            "ERROR: targets 로부터 FASTA 를 만들려면 shallow_msa_dir 이 필요합니다 "
+            "(또는 --fasta / targets.fasta 로 준비된 FASTA 를 직접 주세요)."
+        )
+    written: list[str] = []
+    with open(dst, "w") as out:
+        for t in target_names:
+            a3m = Path(shallow_msa_dir) / f"{t}.a3m"
+            if not a3m.exists():
+                logger.warning("  [skip] 입력 a3m 없음: %s", a3m)
+                continue
+            try:
+                q = _read_a3m_query(str(a3m))
+            except ValueError as exc:
+                logger.warning("  [skip] %s", exc)
+                continue
+            out.write(f">{t}\n{q}\n")
+            written.append(t)
+            logger.info("  %s: query L=%d (from a3m)", t, len(q))
+    if not written:
+        raise SystemExit(f"ERROR: 유효한 입력 a3m 이 하나도 없습니다 (dir={shallow_msa_dir})")
+    logger.info("Subset FASTA: %d/%d targets → %s", len(written), len(target_names), dst)
+    return written
+
+
+def link_protenix_checkpoint(repo_dir, protenix_root, model_name) -> None:
+    """Protenix 가 기대하는 $PROTENIX_ROOT_DIR/checkpoint/<model>.pt 심링크(재다운로드 방지).
+
+    실제 가중치는 $REPO_DIR/checkpoints/checkpoints/<model>.pt.
+    """
+    expected = Path(protenix_root) / "checkpoint" / f"{model_name}.pt"
+    actual = Path(repo_dir) / "checkpoints" / "checkpoints" / f"{model_name}.pt"
+    if not expected.exists() and actual.exists():
+        expected.parent.mkdir(parents=True, exist_ok=True)
+        expected.symlink_to(actual)
+        logger.info("Linked Protenix checkpoint: %s -> %s", expected, actual)
+
+
+def run_ost_scoring(output_dir, mode, target_names, gt_dir, chain_csv, out_csv) -> None:
+    """폴딩 후 예측 CIF vs GT 를 scripts/ost_score.py 로 채점."""
+    repo_dir = Path(__file__).parents[2]
+    if not Path(gt_dir).is_dir():
+        logger.warning("GT_DIR 없음: %s — OST 채점 건너뜀", gt_dir)
+        return
+    cmd = [
+        sys.executable, str(repo_dir / "scripts" / "ost_score.py"),
+        "--pred_root", str(Path(output_dir) / "folds"),
+        "--gt_dir",    str(gt_dir),
+        "--mode",      mode,
+        "--targets",   " ".join(target_names),
+        "--out_csv",   str(out_csv),
+    ]
+    if chain_csv:
+        cmd += ["--chain_csv", str(chain_csv)]
+    logger.info("=== OST 채점 (GT: %s) → %s", gt_dir, out_csv)
+    subprocess.run(cmd, check=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(description="MSAFlow fold benchmark")
-    parser.add_argument("--fasta",           required=True,
-                        help="FASTA file with test protein sequences")
-    parser.add_argument("--decoder_ckpt",    required=True,
-                        help="Path to SFM decoder EMA checkpoint")
-    parser.add_argument("--latent_fm_ckpt",  required=True,
-                        help="Path to latent FM EMA checkpoint")
-    parser.add_argument("--output_dir",      required=True,
-                        help="Root directory for MSA files, fold outputs, and CSV")
-    parser.add_argument("--mode",            default="zeroshot",
-                        choices=["zeroshot", "fewshot", "shallow", "nomsa"],
-                        help="Generation mode: zeroshot | fewshot | shallow | nomsa (default: zeroshot)")
-    parser.add_argument("--ref_pdb_dir",     default=None,
-                        help="Directory with reference PDB files named {name}.pdb")
-    parser.add_argument("--device",          default="cuda")
-    parser.add_argument("--n_seqs",          type=int, default=32,
-                        help="Sequences per seed")
-    parser.add_argument("--n_seeds",         type=int, default=10,
-                        help="Number of latent FM seeds (zeroshot: folds each, reports best)")
-    parser.add_argument("--n_steps",         type=int, default=100,
-                        help="ODE integration steps")
-    parser.add_argument("--temperature",     type=float, default=0.5,
-                        help="SDE temperature (paper: 0.5)")
-    parser.add_argument("--protenix_model",  default="protenix_base_default_v1.0.0",
-                        help="Protenix model name for structure prediction")
-    parser.add_argument("--fold_seeds",      default="101",
-                        help="Comma-separated Protenix folding seeds, e.g. '101,102,103,104,105' "
-                             "(N seeds x --n_sample samples). Distinct from --n_seeds (augmentation).")
-    parser.add_argument("--n_sample",        type=int, default=5,
-                        help="Protenix diffusion samples per seed (default: 5)")
-    parser.add_argument("--tmscore_bin",     default="TMscore",
-                        help="Path or name of TMscore binary")
-    # Few-shot specific
+    parser = argparse.ArgumentParser(
+        description="MSAFlow fold benchmark (YAML config + optional CLI overrides)")
+    parser.add_argument("--config", default=None,
+                        help="YAML 설정 파일(OmegaConf). 개별 CLI 플래그가 항상 우선.")
+    # 아래 플래그는 기본 None → 값이 있으면 config 를 덮어씀(하위호환 유지).
+    parser.add_argument("--fasta",           default=None,
+                        help="준비된 FASTA. 없으면 targets(list/csv)+shallow_msa_dir 로 자동 생성")
+    parser.add_argument("--targets",         nargs="+", default=None,
+                        help="타겟명 직접 지정: 'pdb__A pdb2__A ...' (config targets.list 대체)")
+    parser.add_argument("--targets_csv",     default=None,
+                        help="타겟 CSV(pdb_id,chain_id). config targets.csv 대체")
     parser.add_argument("--shallow_msa_dir", default=None,
-                        help="[fewshot] Directory with shallow A3M files named {target}.a3m")
+                        help="입력 shallow A3M 디렉토리({target}.a3m). query 서열 추출/증강 입력")
+    parser.add_argument("--decoder_ckpt",    default=None, help="SFM decoder EMA checkpoint")
+    parser.add_argument("--latent_fm_ckpt",  default=None, help="latent FM EMA checkpoint")
     parser.add_argument("--protenix_ckpt",   default=None,
-                        help="[fewshot] Protenix .pt checkpoint for Rec track MSA embedding")
-    # Parallelism
-    parser.add_argument("--shard_id",        type=int, default=0,
-                        help="0-based shard index for parallel runs (default: 0)")
-    parser.add_argument("--num_shards",      type=int, default=1,
-                        help="Total number of shards (default: 1 = no sharding)")
-    # Re-run flags
-    parser.add_argument("--regenerate",      action="store_true",
-                        help="Re-generate MSAs even if A3M files already exist")
-    parser.add_argument("--refold",          action="store_true",
-                        help="Re-run Protenix even if CIF output already exists")
+                        help="[fewshot] Rec 트랙용 Protenix .pt")
+    parser.add_argument("--output_dir",      default=None,
+                        help="MSA/fold/CSV 출력 루트")
+    parser.add_argument("--mode",            default=None,
+                        choices=["zeroshot", "fewshot", "shallow", "nomsa"],
+                        help="zeroshot | fewshot | shallow | nomsa")
+    parser.add_argument("--device",          default=None)
+    parser.add_argument("--gpu_id",          type=int, default=None,
+                        help="CUDA_VISIBLE_DEVICES 로 노출할 GPU (기본 config run.gpu_id)")
+    parser.add_argument("--ref_pdb_dir",     default=None)
+    parser.add_argument("--n_seqs",          type=int, default=None)
+    parser.add_argument("--n_seeds",         type=int, default=None)
+    parser.add_argument("--n_steps",         type=int, default=None)
+    parser.add_argument("--temperature",     type=float, default=None)
+    parser.add_argument("--protenix_model",  default=None)
+    parser.add_argument("--fold_seeds",      default=None,
+                        help="쉼표구분 폴딩 seed 직접지정. 없으면 fold_seed_base+n_fold_seeds 로 계산")
+    parser.add_argument("--fold_seed_base",  type=int, default=None)
+    parser.add_argument("--n_fold_seeds",    type=int, default=None)
+    parser.add_argument("--n_sample",        type=int, default=None)
+    parser.add_argument("--tmscore_bin",     default=None)
+    parser.add_argument("--shard_id",        type=int, default=None)
+    parser.add_argument("--num_shards",      type=int, default=None)
+    parser.add_argument("--regenerate",      action="store_true", default=False,
+                        help="A3M 이 있어도 강제 재생성(기본 fresh 라 이미 재생성됨; resume 시 강제용)")
+    parser.add_argument("--refold",          action="store_true", default=False,
+                        help="CIF 이 있어도 강제 재폴딩(기본 fresh 라 이미 재폴딩됨; resume 시 강제용)")
+    parser.add_argument("--resume",          action="store_true", default=False,
+                        help="이어하기: 이전 a3m/CIF 가 있으면 재사용하고 없는 것만 수행 "
+                             "(기본은 fresh — 이전 출력이 있어도 증강·폴딩을 다시 수행)")
+    # OST 채점
+    parser.add_argument("--skip_ost",        action="store_true", default=False,
+                        help="config 가 켜져 있어도 OST 채점을 건너뜀")
+    parser.add_argument("--gt_dir",          default=None)
+    parser.add_argument("--chain_csv",       default=None)
+    parser.add_argument("--ost_csv",         default=None)
     # Deprecated alias
-    parser.add_argument("--no_msa",          action="store_true",
-                        help="Deprecated: use --mode nomsa instead")
+    parser.add_argument("--no_msa",          action="store_true", default=False,
+                        help="Deprecated: --mode nomsa 를 쓰세요")
     args = parser.parse_args()
 
-    run_benchmark(args)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  [ %(name)s ]  %(message)s",
+        datefmt="%Y-%m-%d %H:%M",
+    )
+
+    cfg = OmegaConf.load(args.config) if args.config else OmegaConf.create({})
+
+    def pick(cli_val, path, default):
+        """CLI 값(≠None) 우선, 없으면 config, 없으면 default."""
+        if cli_val is not None:
+            return cli_val
+        val = OmegaConf.select(cfg, path) if path else None
+        return val if val is not None else default
+
+    # ── 기본 실행 설정 ─────────────────────────────────────────────────────────
+    mode = "nomsa" if args.no_msa else pick(args.mode, "run.mode", "zeroshot")
+    output_dir = pick(args.output_dir, "run.output_dir", None)
+    if not output_dir:
+        parser.error("output_dir 없음 (--output_dir 또는 config run.output_dir 지정).")
+    device = pick(args.device, "run.device", "cuda")
+    gpu_id = pick(args.gpu_id, "run.gpu_id", 0)
+    # SLURM(--gres)/사용자가 이미 CUDA_VISIBLE_DEVICES 를 잡았으면 그쪽을 존중한다
+    # (스케줄러 할당을 config 절대인덱스로 덮어쓰면 할당 밖 GPU 를 가리킬 수 있음).
+    # 다만 조용히 무시되지 않도록 명시적으로 로그를 남긴다.
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        logger.info("CUDA_VISIBLE_DEVICES=%s 가 이미 설정됨(SLURM 등) — gpu_id=%s 는 무시",
+                    os.environ["CUDA_VISIBLE_DEVICES"], gpu_id)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # 기본은 fresh run: 이전 출력이 있어도 증강·폴딩을 다시 수행(덮어씀). 그래서 재실행이
+    # OST 만 도는 일이 없다. 큰 배치를 이어서 돌릴 때만 resume=true 로 기존 결과를 재사용.
+    resume = bool(args.resume or (OmegaConf.select(cfg, "run.resume") or False))
+    force_regen = bool(args.regenerate or (OmegaConf.select(cfg, "run.regenerate") or False))
+    force_refold = bool(args.refold or (OmegaConf.select(cfg, "run.refold") or False))
+    regenerate = force_regen or (not resume)
+    refold = force_refold or (not resume)
+    logger.info("실행 모드: %s (regenerate=%s, refold=%s)",
+                "resume(이어하기)" if resume else "fresh(재실행)", regenerate, refold)
+
+    # ── 폴딩 seed 문자열 계산 (pick 과 동일한 is-not-None 규율) ────────────────
+    fold_seed_base = int(pick(args.fold_seed_base, "fold.fold_seed_base", 101))
+    n_fold_seeds = int(pick(args.n_fold_seeds, "fold.n_fold_seeds", 5))
+    fold_seeds = pick(args.fold_seeds, "fold.fold_seeds", None) \
+        or ",".join(str(fold_seed_base + i) for i in range(n_fold_seeds))
+
+    protenix_model = pick(args.protenix_model, "model.protenix_model",
+                          "protenix_base_default_v1.0.0")
+    shallow_msa_dir = pick(args.shallow_msa_dir, "targets.shallow_msa_dir", None)
+
+    # ── 타겟 → FASTA ──────────────────────────────────────────────────────────
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    fasta = pick(args.fasta, "targets.fasta", None)
+    if fasta:
+        target_names = [n for n, _ in parse_fasta(fasta)]
+        logger.info("준비된 FASTA 사용: %s (%d targets)", fasta, len(target_names))
+    else:
+        targets_list = args.targets if args.targets else OmegaConf.select(cfg, "targets.list")
+        targets_csv = pick(args.targets_csv, "targets.csv", None)
+        names = resolve_target_names(list(targets_list) if targets_list else None, targets_csv)
+        if not names:
+            parser.error("타겟이 없습니다 (--fasta / --targets / targets.list / targets.csv).")
+        logger.info("타겟 %d개 (list/csv). shallow_msa_dir=%s", len(names), shallow_msa_dir)
+        fasta = str(Path(output_dir) / "targets_subset.fasta")
+        target_names = build_subset_fasta(names, shallow_msa_dir, fasta)
+
+    # ── Protenix checkpoint 심링크 ─────────────────────────────────────────────
+    repo_dir = Path(__file__).parents[2]
+    protenix_root = os.environ.get("PROTENIX_ROOT_DIR", str(repo_dir))
+    link_protenix_checkpoint(repo_dir, protenix_root, protenix_model)
+
+    # ── run_benchmark 가 소비하는 Namespace 구성 ──────────────────────────────
+    resolved = Namespace(
+        fasta=fasta,
+        decoder_ckpt=pick(args.decoder_ckpt, "model.decoder_ckpt", "dummy"),
+        latent_fm_ckpt=pick(args.latent_fm_ckpt, "model.latent_fm_ckpt", "dummy"),
+        output_dir=output_dir,
+        mode=mode,
+        ref_pdb_dir=pick(args.ref_pdb_dir, "fold.ref_pdb_dir", None),
+        device=device,
+        n_seqs=int(pick(args.n_seqs, "augment.n_seqs", 32)),
+        n_seeds=int(pick(args.n_seeds, "augment.n_seeds", 10)),
+        n_steps=int(pick(args.n_steps, "augment.n_steps", 100)),
+        temperature=float(pick(args.temperature, "augment.temperature", 0.5)),
+        protenix_model=protenix_model,
+        fold_seeds=fold_seeds,
+        n_sample=int(pick(args.n_sample, "fold.n_sample", 5)),
+        tmscore_bin=pick(args.tmscore_bin, "fold.tmscore_bin", "TMscore"),
+        shallow_msa_dir=shallow_msa_dir,
+        protenix_ckpt=pick(args.protenix_ckpt, "model.protenix_ckpt", None),
+        shard_id=int(pick(args.shard_id, "run.shard_id", 0)),
+        num_shards=int(pick(args.num_shards, "run.num_shards", 1)),
+        regenerate=regenerate,
+        refold=refold,
+        no_msa=False,  # 이미 mode 로 반영됨
+    )
+
+    run_benchmark(resolved)
+
+    # ── OST 채점 ────────────────────────────────────────────────────────────────
+    run_ost = (not args.skip_ost) and bool(OmegaConf.select(cfg, "ost.enable"))
+    if run_ost:
+        gt_dir = pick(args.gt_dir, "ost.gt_dir", None)
+        chain_csv = pick(args.chain_csv, "ost.chain_csv", None)
+        ost_csv = pick(args.ost_csv, "ost.out_csv", None) \
+            or str(Path(output_dir) / "monomer_protein_ost.csv")
+        if not gt_dir:
+            logger.warning("ost.enable=true 인데 gt_dir 미지정 — OST 건너뜀")
+        else:
+            # 샤딩 시 예측이 부분집합만 존재하므로, 이 샤드가 실제 처리한 타겟만 채점
+            if resolved.num_shards > 1:
+                scored = target_names[resolved.shard_id::resolved.num_shards]
+            else:
+                scored = target_names
+            run_ost_scoring(output_dir, mode, scored, gt_dir, chain_csv, ost_csv)
 
 
 if __name__ == "__main__":

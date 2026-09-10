@@ -78,33 +78,15 @@ def deep_get(obj, key):
     return None
 
 
-def extract_ref_chain(gt_path, chain_id, out_path):
-    """GT(어셈블리, .cif/.cif.gz)에서 지정 chain 만 떼어 단일-체인 mmCIF 로 저장.
+def run_ost(ost_cmd, model_cif, ref_cif, tmpdir, chain_mapping=None):
+    """OST compare-structures 실행 → (lddt, tm_score, gdt_ts, rmsd).
 
-    예측이 chain A 단량체이므로, 복합체 전체와 비교하면 사슬간(A-B) contact 를
-    예측이 재현 못 한 것으로 lDDT 가 깎인다. chain A 만 남긴 레퍼런스로 비교해야
-    순수 monomer 채점이 된다. chain 을 못 찾으면 None 반환(호출부에서 폴백/스킵).
+    chain_mapping 이 주어지면 '-c <model>:<ref>' 로 대상 chain 만 매핑한다.
+    예측이 chain A 단량체이므로 원본 어셈블리 GT 와 그냥 비교하면 사슬간(A-B)
+    contact 를 예측이 재현 못 한 것으로 lDDT 가 깎인다. '-c A:A' 로 대상 chain 만
+    매핑하면 OST 가 unmapped 체인(B, C…) contact 를 lDDT 에서 제외하므로 순수
+    monomer 채점이 된다. (2026-09-08 검증: gemmi 로 chain A 만 남긴 것과 lddt 동일)
     """
-    import gemmi  # venv 에 존재 (0.6.x)
-    st = gemmi.read_structure(gt_path)  # .gz 자동 처리
-    if len(st) == 0:
-        return None
-    while len(st) > 1:          # 첫 model 만 유지
-        del st[1]
-    model = st[0]
-    names = [ch.name for ch in model]
-    if chain_id not in names:
-        return None
-    for name in list(names):    # 대상 chain 외 전부 제거
-        if name != chain_id:
-            model.remove_chain(name)
-    st.setup_entities()
-    st.make_mmcif_document().write_file(out_path)
-    return out_path
-
-
-def run_ost(ost_cmd, model_cif, ref_cif, tmpdir):
-    """OST compare-structures 실행 → (lddt, tm_score, gdt_ts, rmsd)."""
     out_json = os.path.join(tmpdir, "ost_out.json")
     cmd = ost_cmd + [
         "-m", model_cif,
@@ -114,6 +96,8 @@ def run_ost(ost_cmd, model_cif, ref_cif, tmpdir):
         "--lddt", "--rigid-scores", "--tm-score",
         "--min-pep-length", "4",
     ]
+    if chain_mapping:
+        cmd += ["-c", chain_mapping]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if not os.path.exists(out_json):
         sys.stderr.write(
@@ -200,8 +184,10 @@ def main():
     ap.add_argument("--mode", default="fewshot", help="zeroshot|fewshot|nomsa|shallow")
     ap.add_argument("--targets", required=True, help="공백 구분 pdb_id 목록")
     ap.add_argument("--chain_csv", default=None, help="pdb_id,chain_id CSV (기본 chain A)")
+    ap.add_argument("--model_chain", default=None,
+                    help="예측 CIF 의 체인명(-c <model>:<ref>). 기본은 ref chain 과 동일(A:A)")
     ap.add_argument("--score_full_complex", action="store_true",
-                    help="GT 어셈블리 전체와 비교(기본은 대상 chain 만 떼어 단일-체인 비교)")
+                    help="-c 없이 GT 어셈블리 전체와 비교(chain 매핑 자동 추정)")
     args = ap.parse_args()
 
     ost_cmd = resolve_ost_cmd()
@@ -222,15 +208,13 @@ def main():
                 sys.stderr.write(f"[skip] GT 없음: {args.gt_dir}/{gt_id}.cif\n")
                 continue
 
-            # 기본: GT 어셈블리에서 대상 chain 만 떼어 단일-체인 레퍼런스로 채점
-            if not args.score_full_complex:
-                ref_single = os.path.join(tmpdir, f"{gt_id}_chain{chain}.cif")
-                extracted = extract_ref_chain(gt, chain, ref_single)
-                if extracted is None:
-                    sys.stderr.write(
-                        f"[warn] {target}: GT 에 chain '{chain}' 없음 → 어셈블리 전체로 비교\n")
-                else:
-                    gt = extracted
+            # 기본: 원본 어셈블리 GT 에 '-c model:ref' 매핑으로 대상 chain 만 채점
+            # (gemmi 로 ref 를 미리 자르지 않아도 lDDT 동일 — run_ost docstring 참고)
+            if args.score_full_complex:
+                chain_mapping = None
+            else:
+                model_chain = args.model_chain or chain
+                chain_mapping = f"{model_chain}:{chain}"
 
             preds = enumerate_predictions(args.pred_root, target)
             if not preds:
@@ -238,7 +222,8 @@ def main():
                 continue
 
             for cif, seed, sample, rank_score in preds:
-                lddt, tm, gdt, rmsd = run_ost(ost_cmd, cif, gt, tmpdir)
+                lddt, tm, gdt, rmsd = run_ost(
+                    ost_cmd, cif, gt, tmpdir, chain_mapping=chain_mapping)
                 rows.append({
                     "pdb_id": gt_id,
                     "chain_id": chain,
@@ -254,7 +239,8 @@ def main():
                     "mode": args.mode,
                 })
                 sys.stderr.write(
-                    f"  {gt_id} chain={chain} seed={seed} sample={sample}  "
+                    f"  {gt_id} chain={chain} map={chain_mapping} "
+                    f"seed={seed} sample={sample}  "
                     f"lddt={lddt} tm={tm} gdt_ts={gdt} rmsd={rmsd}\n"
                 )
 
