@@ -120,11 +120,27 @@ def run_ost(ost_cmd, model_cif, ref_cif, tmpdir, chain_mapping=None):
 SEED_RE = re.compile(r"seed[_-](\d+)")
 SAMPLE_RE = re.compile(r"sample[_-](\d+)")
 
+# fold_benchmark.py 가 모드별로 붙이는 폴딩 출력 디렉토리 태그.
+# 같은 output_dir 에 여러 모드 결과가 공존할 수 있으므로, 채점 시 해당 모드의
+# 태그에 맞는 디렉토리만 골라야 크로스-모드 오염(예: nomsa 채점이 zeroshot 의
+# {target}_seed* CIF 를 주워 nomsa 로 라벨링)이 발생하지 않는다.
+_MODE_DIR_SUFFIX = {
+    "nomsa": "_nomsa",
+    "fewshot": "_fewshot",
+    "shallow": "_shallow",
+    "zeroshot": "_seed*",
+}
 
-def enumerate_predictions(pred_root, pdb_id):
-    """(cif_path, seed, sample, ranking_score) 목록 반환."""
+
+def enumerate_predictions(pred_root, pdb_id, mode=None):
+    """(cif_path, seed, sample, ranking_score) 목록 반환.
+
+    mode 가 주어지면 그 모드의 디렉토리 태그({target}_nomsa / _fewshot / _shallow /
+    _seed*)에 해당하는 예측만 열거한다. mode 가 None/미지원이면 기존처럼 {target}_* 전부.
+    """
+    suffix = _MODE_DIR_SUFFIX.get(mode, "_*")
     cifs = sorted(glob.glob(
-        os.path.join(pred_root, f"{pdb_id}_*", "protenix_out", "**", "*_sample_*.cif"),
+        os.path.join(pred_root, f"{pdb_id}{suffix}", "protenix_out", "**", "*_sample_*.cif"),
         recursive=True,
     ))
     out = []
@@ -216,7 +232,7 @@ def main():
                 model_chain = args.model_chain or chain
                 chain_mapping = f"{model_chain}:{chain}"
 
-            preds = enumerate_predictions(args.pred_root, target)
+            preds = enumerate_predictions(args.pred_root, target, mode=args.mode)
             if not preds:
                 sys.stderr.write(f"[skip] 예측 CIF 없음: {target}\n")
                 continue

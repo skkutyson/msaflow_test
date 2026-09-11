@@ -877,9 +877,13 @@ def main():
 
     # ── 기본 실행 설정 ─────────────────────────────────────────────────────────
     mode = "nomsa" if args.no_msa else pick(args.mode, "run.mode", "zeroshot")
-    output_dir = pick(args.output_dir, "run.output_dir", None)
-    if not output_dir:
+    base_output_dir = pick(args.output_dir, "run.output_dir", None)
+    if not base_output_dir:
         parser.error("output_dir 없음 (--output_dir 또는 config run.output_dir 지정).")
+    # 모드별 네임스페이스: msas/folds/csv/OST 전부 {output_dir}/{mode}/ 아래로 보내
+    # 여러 모드 결과가 한 폴더에 섞이지 않게 한다. 이 아래로는 output_dir = 모드별 경로.
+    output_dir = str(Path(base_output_dir) / mode)
+    logger.info("출력 디렉토리(모드별): %s", output_dir)
     device = pick(args.device, "run.device", "cuda")
     gpu_id = pick(args.gpu_id, "run.gpu_id", 0)
     # SLURM(--gres)/사용자가 이미 CUDA_VISIBLE_DEVICES 를 잡았으면 그쪽을 존중한다
