@@ -14,8 +14,10 @@
 run:
   mode: fewshot            # zeroshot | fewshot | shallow | nomsa
   # mode-agnostic 베이스. 실제 출력은 {output_dir}/{mode}/ 로 자동 분리되어
-  # 모드끼리 절대 섞이지 않는다 (예: runs/fold_benchmark/fewshot/...).
-  output_dir: /home/yjlee4/MSA_FLOW/runs/fold_benchmark
+  # 모드끼리 절대 섞이지 않는다 (예: /store/yjlee4/runs/fold_benchmark/fewshot/...).
+  # 로그인 노드(home) 용량 이슈로 /store 에 저장 (GPU 노드에서만 마운트됨).
+  # msas(a3m)/folds/shard.csv/OST csv 전부 이 아래로 간다.
+  output_dir: /store/yjlee4/runs/fold_benchmark
   device: cuda
   gpu_id: 0                # CUDA_VISIBLE_DEVICES 로 노출할 GPU 인덱스
   # 기본(resume: false) = fresh: 이전 출력이 있어도 증강·폴딩을 다시 수행(덮어씀).

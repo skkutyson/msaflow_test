@@ -22,7 +22,8 @@
 run:
   mode: fewshot            # zeroshot | fewshot | shallow | nomsa
   # mode-agnostic 베이스. 실제 출력은 {output_dir}/{mode}/ 로 자동 분리됨.
-  output_dir: /home/yjlee4/MSA_FLOW/runs/fold_benchmark_af3
+  # 로그인 노드 용량 이슈로 /store 에 저장 (GPU 노드에서만 마운트됨).
+  output_dir: /store/yjlee4/runs/fold_benchmark_af3
   device: cuda
   gpu_id: 0
   resume: false            # 기본 fresh(재실행). true = 이어하기(기존 a3m/CIF 재사용)

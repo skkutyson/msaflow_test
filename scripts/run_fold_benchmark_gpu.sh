@@ -63,9 +63,11 @@ echo " Python : $(python --version 2>&1)"
 echo " Started: $(date)"
 echo "============================================================"
 
-mkdir -p "$REPO_DIR/runs"
+# 로그도 로그인 노드(home) 대신 /store 에 저장 (용량 이슈). LOG_DIR 로 재정의 가능.
+LOG_DIR=${LOG_DIR:-/store/yjlee4/runs}
+mkdir -p "$LOG_DIR"
 python "$REPO_DIR/msaflow/inference/fold_benchmark.py" --config "$CONFIG" "$@" \
-    2>&1 | tee "$REPO_DIR/runs/fold_benchmark_last.log"
+    2>&1 | tee "$LOG_DIR/fold_benchmark_last.log"
 # tee 가 파이프 종료코드를 가리지 않도록 python 의 실제 exit code 를 보존해 전파
 # (sbatch 잡 상태가 FAILED/COMPLETED 로 정확히 찍히게)
 status=${PIPESTATUS[0]}
