@@ -852,6 +852,9 @@ def main():
     # OST 채점
     parser.add_argument("--skip_ost",        action="store_true", default=False,
                         help="config 가 켜져 있어도 OST 채점을 건너뜀")
+    parser.add_argument("--score_only",      action="store_true", default=False,
+                        help="폴딩을 건너뛰고 이미 생성된 folds/ 의 CIF 만 OST 채점 "
+                             "(모델 로딩/GPU 불필요; ost.enable 무시하고 무조건 채점)")
     parser.add_argument("--gt_dir",          default=None)
     parser.add_argument("--chain_csv",       default=None)
     parser.add_argument("--ost_csv",         default=None)
@@ -961,10 +964,14 @@ def main():
         no_msa=False,  # 이미 mode 로 반영됨
     )
 
-    run_benchmark(resolved)
+    if args.score_only:
+        logger.info("score_only=True — 폴딩 건너뜀. 기존 folds/ CIF 만 OST 채점합니다.")
+    else:
+        run_benchmark(resolved)
 
     # ── OST 채점 ────────────────────────────────────────────────────────────────
-    run_ost = (not args.skip_ost) and bool(OmegaConf.select(cfg, "ost.enable"))
+    # score_only 면 ost.enable 과 무관하게(단, --skip_ost 는 존중) 무조건 채점.
+    run_ost = (not args.skip_ost) and (args.score_only or bool(OmegaConf.select(cfg, "ost.enable")))
     if run_ost:
         gt_dir = pick(args.gt_dir, "ost.gt_dir", None)
         chain_csv = pick(args.chain_csv, "ost.chain_csv", None)

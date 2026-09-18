@@ -37,11 +37,21 @@ if [ ! -f "$CONFIG" ]; then
     exit 1
 fi
 
+# ── score-only 모드 감지 ──────────────────────────────────────────────────────
+# --score_only 가 인자에 있으면 폴딩 없이 기존 CIF 만 OST 채점 → GPU/CUDA 불필요.
+SCORE_ONLY=0
+for _arg in "$@"; do
+    if [ "$_arg" = "--score_only" ]; then SCORE_ONLY=1; break; fi
+done
+
 # ── GPU 노드 확인 ─────────────────────────────────────────────────────────────
-if ! command -v nvidia-smi >/dev/null 2>&1; then
+if [ "$SCORE_ONLY" -eq 0 ] && ! command -v nvidia-smi >/dev/null 2>&1; then
     echo "ERROR: nvidia-smi가 없습니다. 로그인 노드가 아니라 GPU 컴퓨트 노드에서 실행하세요." >&2
     echo "       예)  srun --gres=gpu:RTX6000:1 --pty bash  후 다시 실행" >&2
     exit 1
+fi
+if [ "$SCORE_ONLY" -eq 1 ]; then
+    echo "[score-only] 폴딩 건너뜀 — 기존 CIF 에 대해 OST 채점만 수행 (GPU 불필요)"
 fi
 
 # ── 모듈 / CUDA (있으면 로드) ─────────────────────────────────────────────────
