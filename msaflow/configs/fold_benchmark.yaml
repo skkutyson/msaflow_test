@@ -59,7 +59,7 @@ fold:                      # Protenix 폴딩 샘플링: n_fold_seeds seed × n_s
   n_fold_seeds: 5
   fold_seed_base: 101      # seed = base, base+1, ... (총 n_fold_seeds 개)
   fold_seeds: null         # 직접 지정 시(예: "101,102,103") 위 두 값 무시
-  n_sample: 5              # seed 당 diffusion 샘플 수
+  n_sample: 1              # seed 당 diffusion 샘플 수
   ref_pdb_dir: null        # 참조 PDB 있으면 fold_benchmark 자체 TM-score 계산
   tmscore_bin: TMscore
 

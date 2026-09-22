@@ -25,6 +25,8 @@ dependencies = [
     "nvidia-cuda-nvrtc-cu12>=12.8,<13",
     "nvidia-nvjitlink-cu12>=12.8,<13",
     "nvidia-nccl-cu12>=2.21,<3",
+    "colabfold[alphafold3]",
+    "jax[cuda13]>=0.10.2",
 ]
 
 [project.optional-dependencies]
@@ -40,6 +42,7 @@ dev = [
 protenix = { path = "Protenix", editable = true }
 fair-esm = { path = "esm" }
 torch = { index = "pytorch-cu128" }
+colabfold = { git = "https://github.com/sokrypton/ColabFold", rev = "af3-preview" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
@@ -48,7 +51,7 @@ explicit = true
 
 [tool.uv]
 override-dependencies = [
-    "fair-esm @ file:///mnt/MSA_FLOW/esm",
+    "fair-esm @ file:///mnt/MSA_FLOW/esm", "rdkit==2025.9.4"
     # torch 2.7.1+cu128 (CUDA 12.8) supports Blackwell sm_120 and satisfies
     # protenix==1.1.0's torch==2.7.1 pin without any version override.
 ]

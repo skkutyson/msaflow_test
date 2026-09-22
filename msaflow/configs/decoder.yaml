@@ -20,7 +20,7 @@ data:
   num_workers: 4
 
 training:
-  epochs: 21              # extended from 7: resume from epoch 7 checkpoint
+  epochs: 7             # extended from 7: resume from epoch 7 checkpoint
   lr: 1.0e-5
   weight_decay: 0.1
   warmup_steps: 700
@@ -28,10 +28,10 @@ training:
   grad_accumulation: 4
   seed: 42
   output_dir: /runs/decoder
-  resume: false            # resume from latest.pt
+  resume: false           # resume from latest.pt
   log_every: 100
   ema_decay: 0.998
-  use_ema: true
+  use_ema: false
   mixed_precision: "bf16"
   use_wandb: true
   wandb_project: msaflow

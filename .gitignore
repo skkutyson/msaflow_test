@@ -70,3 +70,8 @@ Thumbs.db
 /scripts/find_low_msa.sh
 /scripts/compare_orphan_bench.py
 /scripts/fetch_foldbench_msa.py
+nohup.out
+common/components.cif
+common/components.cif.rdkit_mol.pkl
+common/clusters-by-entity-40.txt
+common/obsolete_release_date.csv
