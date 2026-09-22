@@ -28,10 +28,13 @@ dependencies = [
     "nvidia-nvjitlink-cu12>=12.8,<13",
     "nvidia-nccl-cu12>=2.21,<3",
     "colabfold[alphafold3]",
+    # cuda12 (not cuda13): cluster GPU nodes run driver 550.67 (max CUDA 12.4);
+    # jax[cuda13] needs a 580+ driver -> cudaErrorInsufficientDriver. cuda12
+    # matches torch cu128 / nvidia-*-cu12 already used here.
     # Pin to 0.11.1: flax 0.12.9 (pulled via colabfold[alphafold3]) requires
     # jax>=0.11.1 but uses jax.experimental.hijax.HiPrimitive, which jax 0.11.2
     # removed -> AttributeError on `import flax.nnx`. 0.11.1 still has it.
-    "jax[cuda13]>=0.11.1,<0.11.2",
+    "jax[cuda12]>=0.11.1,<0.11.2",
 ]
 
 [project.optional-dependencies]
@@ -56,9 +59,12 @@ explicit = true
 
 [tool.uv]
 override-dependencies = [
-    "fair-esm @ file:///mnt/MSA_FLOW/esm", "rdkit==2025.9.4"
+    "fair-esm @ file:///mnt/MSA_FLOW/esm", "rdkit==2025.9.4",
     # torch 2.7.1+cu128 (CUDA 12.8) supports Blackwell sm_120 and satisfies
     # protenix==1.1.0's torch==2.7.1 pin without any version override.
+    # torch pins cudnn ==9.7.1.26 but jax[cuda12] 0.11.1 needs >=9.8; cudnn 9.x
+    # is ABI-stable so 9.8 satisfies both. Override torch's exact pin.
+    "nvidia-cudnn-cu12>=9.8,<10",
 ]
 
 [tool.setuptools.packages.find]
