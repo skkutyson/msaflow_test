@@ -1,0 +1,31 @@
+# ==============================================================================
+# colabfold_batch 단독 실행 설정 (Protenix 파이프라인 X — colabfold_batch 만)
+#
+#   입력 a3m → colabfold_batch 폴딩 → output_dir 에 CIF/plddt/pae 저장
+#
+# 실행 (GPU 노드에서, sbatch 없이 직접):
+#     bash scripts/run_colabfold_gpu.sh msaflow/configs/colabfold_batch.yaml
+#   타겟만 바꿔서:
+#     bash scripts/run_colabfold_gpu.sh msaflow/configs/colabfold_batch.yaml \
+#          --target 7pv5-assembly1__A
+#   colabfold_batch 플래그 직접 덮어쓰기(그대로 뒤에 붙음):
+#     bash scripts/run_colabfold_gpu.sh ... -- --num-seeds 2 --save-all
+# ==============================================================================
+
+run:
+  gpu_id: 1                # CUDA_VISIBLE_DEVICES 로 노출할 로컬 GPU 인덱스 (0/1 …)
+  # 입력 a3m 소스 디렉토리 — fold_benchmark.yaml 의 shallow_msa_dir 와 동일.
+  # 파일명은 {target}.a3m. target 만 바꾸면 다른 타겟을 돌린다.
+  a3m_dir: /store/deepfold3/results/msa/a3m
+  target: 5sbj-assembly1__A
+  # (선택) a3m_dir/target 대신 입력을 통째로 지정하고 싶으면 여기에.
+  # a3m 파일 하나, 또는 a3m/FASTA 가 든 디렉토리 모두 가능. null 이면 위 두 값 사용.
+  input: null
+  output_dir: /store/yjlee4/runs/colabfold_batch   # {output_dir}/{target}/ 로 분리 저장
+
+colabfold:
+  model_type: auto         # auto | alphafold2_ptm | alphafold2_multimer_v3 | alphafold3 …
+  num_models: 5            # 1~5
+  num_recycle: 3
+  # a3m 입력이면 서버 MSA 대신 파일 MSA 를 쓰므로 msa-mode 는 무시됨.
+  extra_flags: []          # 예: ["--num-seeds", "2", "--save-all", "--amber"]
