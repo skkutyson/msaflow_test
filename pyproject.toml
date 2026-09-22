@@ -6,7 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "msaflow"
 version = "0.1.0"
 description = "MSA generation via flow matching in latent space"
-requires-python = ">=3.11,<3.14"
+# >=3.12: colabfold[alphafold3] -> flax 0.12.9 needs jax>=0.11.1, whose
+# cuda13 wheels are Python 3.12+ only. 3.11 cannot run the af3 stack.
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "torch>=2.7",
     "numpy>=1.24",
@@ -26,7 +28,10 @@ dependencies = [
     "nvidia-nvjitlink-cu12>=12.8,<13",
     "nvidia-nccl-cu12>=2.21,<3",
     "colabfold[alphafold3]",
-    "jax[cuda13]>=0.10.2",
+    # Pin to 0.11.1: flax 0.12.9 (pulled via colabfold[alphafold3]) requires
+    # jax>=0.11.1 but uses jax.experimental.hijax.HiPrimitive, which jax 0.11.2
+    # removed -> AttributeError on `import flax.nnx`. 0.11.1 still has it.
+    "jax[cuda13]>=0.11.1,<0.11.2",
 ]
 
 [project.optional-dependencies]
