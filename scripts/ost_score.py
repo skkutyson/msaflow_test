@@ -29,7 +29,7 @@ import sys
 import tempfile
 
 CSV_FIELDS = [
-    "pdb_id", "chain_id", "seed", "sample", "ranking_score", "prediction_path",
+    "pdb_id", "chain_id", "seed", "sample", "ranking_score", "plddt", "prediction_path",
     "dockq_score", "irmsd", "lrmsd", "len_dockq",
     "lddt", "tm_score", "gdt_ts", "rmsd", "mode",
 ]
@@ -149,17 +149,21 @@ def enumerate_predictions(pred_root, pdb_id, mode=None):
         seed = int(m_seed.group(1)) if m_seed else 101
         m_samp = SAMPLE_RE.search(os.path.basename(cif))
         sample = int(m_samp.group(1)) if m_samp else 0
-        # ranking_score: 같은 폴더의 summary_confidence_sample_<rank>.json
+        # ranking_score & plddt: 같은 폴더의 summary_confidence_sample_<rank>.json
+        # plddt = mean atom pLDDT ×100 (Protenix sample_confidence.py 참고)
         rank_score = ""
+        plddt = ""
         summ = cif.replace(f"_sample_{sample}.cif",
                            f"_summary_confidence_sample_{sample}.json")
         if os.path.exists(summ):
             try:
                 with open(summ) as fh:
-                    rank_score = json.load(fh).get("ranking_score", "")
+                    conf = json.load(fh)
+                rank_score = conf.get("ranking_score", "")
+                plddt = conf.get("plddt", "")
             except Exception:
                 pass
-        out.append((cif, seed, sample, rank_score))
+        out.append((cif, seed, sample, rank_score, plddt))
     return out
 
 
@@ -237,7 +241,7 @@ def main():
                 sys.stderr.write(f"[skip] 예측 CIF 없음: {target}\n")
                 continue
 
-            for cif, seed, sample, rank_score in preds:
+            for cif, seed, sample, rank_score, plddt in preds:
                 lddt, tm, gdt, rmsd = run_ost(
                     ost_cmd, cif, gt, tmpdir, chain_mapping=chain_mapping)
                 rows.append({
@@ -246,6 +250,7 @@ def main():
                     "seed": seed,
                     "sample": sample,
                     "ranking_score": rank_score,
+                    "plddt": plddt,
                     "prediction_path": cif,
                     "dockq_score": "", "irmsd": "", "lrmsd": "", "len_dockq": 0,
                     "lddt": lddt if lddt is not None else "",
