@@ -40,6 +40,12 @@ N_STEPS=${N_STEPS:-100}
 TEMPERATURE=${TEMPERATURE:-0.5}
 N_CYCLE=${N_CYCLE:-3}
 
+# RESUME=1 (기본): 이미 npz 있는 타겟 skip → GPU 조금씩 날 때마다 끊어 돌려도 이어짐.
+# PLOT=1 (기본): 타겟마다 바로 PCA plot 저장. 매 타겟 후 GPU 캐시 비움.
+RESUME=${RESUME:-1}
+PLOT=${PLOT:-1}
+PLOT_METHOD=${PLOT_METHOD:-pca}
+
 # ── GPU 노드 확인 ─────────────────────────────────────────────────────────────
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     echo "ERROR: nvidia-smi가 없습니다. 로그인 노드가 아니라 GPU 컴퓨트 노드에서 실행하세요." >&2
@@ -77,11 +83,14 @@ echo " OUT_BASE: $OUT_BASE"
 echo " TARGETS : ${TARGETS:-<from csv: $CSV>}"
 echo " LATENT  : $LATENT_FM_CKPT"
 echo " N_SEEDS : $N_SEEDS  N_STEPS: $N_STEPS  TEMP: $TEMPERATURE  N_CYCLE: $N_CYCLE"
+echo " RESUME  : $RESUME  PLOT: $PLOT ($PLOT_METHOD)"
 echo " Started : $(date)"
 echo "============================================================"
 
-TARGET_ARG=""
-[ -n "$TARGETS" ] && TARGET_ARG="--targets $TARGETS"
+EXTRA=""
+[ -n "$TARGETS" ] && EXTRA="$EXTRA --targets $TARGETS"
+[ "$RESUME" = "1" ] || EXTRA="$EXTRA --no_resume"
+[ "$PLOT" = "1" ]   || EXTRA="$EXTRA --no_plot"
 
 python "$REPO_DIR/scripts/compare_msa_emb.py" --out_base "$OUT_BASE" extract \
     --a3m_dir        "$A3M_DIR" \
@@ -90,7 +99,8 @@ python "$REPO_DIR/scripts/compare_msa_emb.py" --out_base "$OUT_BASE" extract \
     --protenix_ckpt  "$PROTENIX_CKPT" \
     --n_seeds "$N_SEEDS" --n_steps "$N_STEPS" \
     --temperature "$TEMPERATURE" --n_cycle "$N_CYCLE" \
-    $TARGET_ARG "$@"
+    --plot_method "$PLOT_METHOD" \
+    $EXTRA "$@"
 
 echo "============================================================"
 echo " Done: $(date)   →  $OUT_BASE"

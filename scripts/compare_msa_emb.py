@@ -15,7 +15,8 @@ Output layout under --out_base (default /store/yjlee4/runs/compare_emb):
     <out_base>/<target>/latent_fm/<target>.npz   zeroshot: (K=4, L, 128)
 
 Commands:
-  extract    GPU: load models once, dump real + zero-shot npz for N targets.
+  extract    GPU: per-target loop (real → zero-shot → inline plot → free VRAM);
+             --resume skips done targets, so a scarce GPU can finish in chunks.
   plot       CPU: PCA / t-SNE scatter for ONE target.
   plot-all   CPU: one grid over ALL targets; the most-similar target is ★ BEST.
 
@@ -95,7 +96,11 @@ def per_residue_cos(real, zeroshot):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Stage 1: extraction (GPU) — two passes to keep peak VRAM low
+# Stage 1: extraction (GPU)
+# Per-target loop: real → zero-shot → (inline plot) → free VRAM → next.
+# Models load once (weights ~4 GB); the VRAM hog is per-target activations, so
+# we empty_cache() after every target. --resume skips already-done targets so a
+# scarce / preemptible GPU can finish the set in several short runs.
 # ──────────────────────────────────────────────────────────────────────────────
 
 def extract(args):
@@ -108,6 +113,10 @@ def extract(args):
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
+    def empty_cache():
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     # Target source priority: explicit --targets > --csv > all *.a3m in a3m_dir.
     if args.targets:
         targets = args.targets
@@ -119,7 +128,16 @@ def extract(args):
     if not targets:
         raise SystemExit("no targets (check --targets / --csv / a3m_dir)")
 
-    # Parse a3m up front; targets whose a3m is missing are skipped (not fatal).
+    # --resume: drop targets whose real + latent_fm npz already exist.
+    if args.resume:
+        done = [t for t in targets
+                if _real_npz(args.out_base, t).exists()
+                and _lfm_npz(args.out_base, t).exists()]
+        if done:
+            logger.info("resume: %d/%d already done, skipping", len(done), len(targets))
+        targets = [t for t in targets if t not in set(done)]
+
+    # Parse a3m; targets whose a3m is missing are skipped (not fatal).
     parsed, missing = {}, []
     for t in targets:
         a3m = Path(args.a3m_dir) / f"{t}.a3m"
@@ -127,52 +145,66 @@ def extract(args):
             missing.append(t)
             continue
         _, seqs = parse_a3m(str(a3m))
-        seqs = filter_msa(seqs)
-        parsed[t] = seqs
-        logger.info("  %s: depth=%d L=%d", t, len(seqs), len(seqs[0].replace("-", "")))
+        parsed[t] = filter_msa(seqs)
     if missing:
         logger.warning("skipped %d target(s) with no a3m in %s: %s",
                        len(missing), args.a3m_dir, ", ".join(missing))
     targets = [t for t in targets if t in parsed]
     if not targets:
-        raise SystemExit(f"no target a3m found under {args.a3m_dir}")
+        logger.info("nothing to do (all done / no a3m)")
+        return
     logger.info("extracting %d target(s)", len(targets))
 
-    # ── Pass A — real (Protenix trunk) ───────────────────────────────────────
+    # Load all models once — reloading per target would cost minutes × N.
     protenix = load_msa_module(args.protenix_ckpt, device)
-    for t in targets:
-        real = extract_msa_embedding_protenix(
-            parsed[t], protenix, device, n_cycle=args.n_cycle
-        ).float().cpu().numpy()
-        out = _real_npz(args.out_base, t)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(out, real=real, query=parsed[t][0].replace("-", ""),
-                            n_cycle=args.n_cycle)
-        logger.info("  [real] %s %s → %s", t, real.shape, out)
-    del protenix
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    # ── Pass B — zero-shot (ESM2 → latent FM), K seeds ───────────────────────
     esm_model, alphabet = load_esm2(device)
     latent_fm = load_latent_fm(args.latent_fm_ckpt, device)
-    for t in targets:
-        query = parsed[t][0].replace("-", "")
-        esm_emb = extract_esm_embedding(query, esm_model, alphabet, device)
-        esm_emb = esm_emb.unsqueeze(0).to(device)                  # (1, L, 1280)
-        seeds = []
-        for s in range(args.n_seeds):
-            torch.manual_seed(s)
-            z = sample_msa_embeddings(latent_fm, esm_emb,
-                                      n_steps=args.n_steps, temperature=args.temperature)
-            seeds.append(z[0].float().cpu().numpy())
-        zeroshot = np.stack(seeds, axis=0)                         # (K, L, 128)
-        out = _lfm_npz(args.out_base, t)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(out, zeroshot=zeroshot, query=query,
-                            temperature=args.temperature, n_steps=args.n_steps)
-        logger.info("  [latent_fm] %s %s → %s", t, zeroshot.shape, out)
-    logger.info("extract done: %d target(s) under %s", len(targets), args.out_base)
+
+    for i, t in enumerate(targets, 1):
+        seqs = parsed[t]
+        query = seqs[0].replace("-", "")
+        logger.info("[%d/%d] %s  depth=%d L=%d", i, len(targets), t, len(seqs), len(query))
+        try:
+            # real: AF3/Protenix MSA module (1 embedding)
+            real = extract_msa_embedding_protenix(
+                seqs, protenix, device, n_cycle=args.n_cycle
+            ).float().cpu().numpy()
+            empty_cache()
+
+            # zero-shot: ESM2 → latent FM, K seeds
+            esm_emb = extract_esm_embedding(query, esm_model, alphabet, device)
+            esm_emb = esm_emb.unsqueeze(0).to(device)              # (1, L, 1280)
+            seeds = []
+            for s in range(args.n_seeds):
+                torch.manual_seed(s)
+                z = sample_msa_embeddings(latent_fm, esm_emb,
+                                          n_steps=args.n_steps, temperature=args.temperature)
+                seeds.append(z[0].float().cpu().numpy())
+            zeroshot = np.stack(seeds, axis=0)                     # (K, L, 128)
+            del esm_emb
+            empty_cache()
+        except torch.cuda.OutOfMemoryError:
+            logger.error("[%d/%d] %s OOM — skipping (rerun with more VRAM)", i, len(targets), t)
+            empty_cache()
+            continue
+
+        # Crop to common L, then save both npz.
+        L = min(real.shape[0], zeroshot.shape[1])
+        real, zeroshot = real[:L], zeroshot[:, :L]
+        for npz, kw in ((_real_npz(args.out_base, t), dict(real=real, n_cycle=args.n_cycle)),
+                        (_lfm_npz(args.out_base, t),
+                         dict(zeroshot=zeroshot, temperature=args.temperature, n_steps=args.n_steps))):
+            npz.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(npz, query=query, **kw)
+        logger.info("  saved real%s + zeroshot%s", real.shape, zeroshot.shape)
+
+        # Inline per-target plot so results land as we go (no GPU needed here).
+        if args.plot:
+            png = Path(args.out_base) / t / f"{t}_compare.png"
+            cos = _render_target(t, real, zeroshot, str(png), args.plot_method, seed=0)
+            logger.info("  plotted %s  (per-res cos=%.4f)", png, cos)
+
+    logger.info("extract done under %s", args.out_base)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -206,25 +238,32 @@ def _scatter(ax, real, zeroshot, method, seed=0):
     return per_residue_cos(real, zeroshot)
 
 
-def plot(args):
+def _render_target(target, real, zeroshot, out, method="both", seed=0):
+    """Save a single-target scatter figure. Returns per-residue cosine."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    real, zeroshot = _load_pair(args.out_base, args.target)
-    methods = ["pca", "tsne"] if args.method == "both" else [args.method]
+    methods = ["pca", "tsne"] if method == "both" else [method]
     fig, axes = plt.subplots(1, len(methods), figsize=(7 * len(methods), 6), squeeze=False)
     cos = None
-    for ax, method in zip(axes[0], methods):
-        cos = _scatter(ax, real, zeroshot, method, seed=args.seed)
-        ax.set_title(f"{method.upper()} — per-residue MSA embedding")
-        ax.set_xlabel(f"{method}-1"); ax.set_ylabel(f"{method}-2")
+    for ax, m in zip(axes[0], methods):
+        cos = _scatter(ax, real, zeroshot, m, seed=seed)
+        ax.set_title(f"{m.upper()} — per-residue MSA embedding")
+        ax.set_xlabel(f"{m}-1"); ax.set_ylabel(f"{m}-2")
         ax.legend(loc="best", framealpha=0.9)
-    fig.suptitle(f"{args.target}   L={real.shape[0]}   per-res cos={cos:.3f}", fontsize=12)
+    fig.suptitle(f"{target}   L={real.shape[0]}   per-res cos={cos:.3f}", fontsize=12)
     fig.tight_layout()
-    out = args.out or str(Path(args.out_base) / args.target / f"{args.target}_compare.png")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=150)
+    plt.close(fig)
+    return cos
+
+
+def plot(args):
+    real, zeroshot = _load_pair(args.out_base, args.target)
+    out = args.out or str(Path(args.out_base) / args.target / f"{args.target}_compare.png")
+    cos = _render_target(args.target, real, zeroshot, out, args.method, args.seed)
     logger.info("wrote %s   (per-res cos=%.4f)", out, cos)
 
 
@@ -301,7 +340,13 @@ def main():
     pe.add_argument("--temperature", type=float, default=0.5)
     pe.add_argument("--n_cycle", type=int, default=3)
     pe.add_argument("--device", default="cuda")
-    pe.set_defaults(func=extract)
+    pe.add_argument("--no_resume", dest="resume", action="store_false",
+                    help="re-extract even if npz already exist (default: resume/skip)")
+    pe.add_argument("--no_plot", dest="plot", action="store_false",
+                    help="skip the inline per-target figure (default: plot inline)")
+    pe.add_argument("--plot_method", choices=["pca", "tsne", "both"], default="pca",
+                    help="inline plot projection (default: pca — fast)")
+    pe.set_defaults(func=extract, resume=True, plot=True)
 
     pp = sub.add_parser("plot", help="CPU: one target, PCA/t-SNE scatter")
     pp.add_argument("--target", required=True)
