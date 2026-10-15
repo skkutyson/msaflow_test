@@ -27,6 +27,9 @@ REPO_DIR=${REPO_DIR:-/home/yjlee4/MSA_FLOW}
 
 A3M_DIR=${A3M_DIR:-/store/deepfold3/results/msa/a3m}
 OUT_BASE=${OUT_BASE:-/store/yjlee4/runs/compare_emb}
+# 기본은 monomer_protein.csv 의 (pdb_id,chain_id) → pdb_id__chain_id 타겟만.
+# a3m 이 없는 타겟은 자동 skip. TARGETS 를 주면 CSV 대신 그 목록을 쓴다.
+CSV=${CSV:-$REPO_DIR/monomer_protein.csv}
 TARGETS=${TARGETS:-}
 
 LATENT_FM_CKPT=${LATENT_FM_CKPT:-$REPO_DIR/runs/latent_fm/latest.pt}
@@ -48,6 +51,7 @@ fi
 [ -f "$LATENT_FM_CKPT" ] || { echo "ERROR: latent_fm ckpt 없음: $LATENT_FM_CKPT" >&2; exit 1; }
 [ -f "$PROTENIX_CKPT" ]  || { echo "ERROR: protenix ckpt 없음: $PROTENIX_CKPT" >&2; exit 1; }
 [ -d "$A3M_DIR" ]        || { echo "ERROR: a3m 디렉터리 없음: $A3M_DIR" >&2; exit 1; }
+[ -n "$TARGETS" ] || [ -f "$CSV" ] || { echo "ERROR: csv 없음: $CSV" >&2; exit 1; }
 
 # ── 모듈 / CUDA (있으면 로드) ─────────────────────────────────────────────────
 module load cuda/13.0.2 2>/dev/null || true
@@ -70,7 +74,7 @@ echo " Node    : $(hostname)"
 echo " Python  : $(python --version 2>&1)"
 echo " A3M_DIR : $A3M_DIR"
 echo " OUT_BASE: $OUT_BASE"
-echo " TARGETS : ${TARGETS:-<all *.a3m>}"
+echo " TARGETS : ${TARGETS:-<from csv: $CSV>}"
 echo " LATENT  : $LATENT_FM_CKPT"
 echo " N_SEEDS : $N_SEEDS  N_STEPS: $N_STEPS  TEMP: $TEMPERATURE  N_CYCLE: $N_CYCLE"
 echo " Started : $(date)"
@@ -81,6 +85,7 @@ TARGET_ARG=""
 
 python "$REPO_DIR/scripts/compare_msa_emb.py" --out_base "$OUT_BASE" extract \
     --a3m_dir        "$A3M_DIR" \
+    --csv            "$CSV" \
     --latent_fm_ckpt "$LATENT_FM_CKPT" \
     --protenix_ckpt  "$PROTENIX_CKPT" \
     --n_seeds "$N_SEEDS" --n_steps "$N_STEPS" \

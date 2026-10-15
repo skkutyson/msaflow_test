@@ -31,6 +31,7 @@ Usage
   uv run python scripts/compare_msa_emb.py plot-all
 """
 import argparse
+import csv
 import logging
 from pathlib import Path
 
@@ -40,6 +41,7 @@ logger = logging.getLogger("compare_msa_emb")
 
 # Defaults wired to this project's layout.
 DEF_A3M_DIR = "/store/deepfold3/results/msa/a3m"
+DEF_CSV = "/home/yjlee4/MSA_FLOW/monomer_protein.csv"
 DEF_OUT_BASE = "/store/yjlee4/runs/compare_emb"
 DEF_LATENT_FM = "/home/yjlee4/MSA_FLOW/runs/latent_fm/latest.pt"
 DEF_PROTENIX = "/home/yjlee4/MSA_FLOW/checkpoints/checkpoints/protenix_base_default_v1.0.0.pt"
@@ -59,6 +61,17 @@ def _lfm_npz(out_base, target):
 
 def _discover_targets(a3m_dir):
     return sorted(p.stem for p in Path(a3m_dir).glob("*.a3m"))
+
+
+def _targets_from_csv(csv_path):
+    """monomer_protein.csv (pdb_id,chain_id) → ['<pdb_id>__<chain_id>', ...]."""
+    targets = []
+    with open(csv_path, newline="") as fh:
+        for row in csv.DictReader(fh):
+            pdb, chain = row["pdb_id"].strip(), row["chain_id"].strip()
+            if pdb and chain:
+                targets.append(f"{pdb}__{chain}")
+    return targets
 
 
 def _load_pair(out_base, target):
@@ -94,19 +107,36 @@ def extract(args):
     from msaflow.inference.generate import load_latent_fm, load_esm2, load_msa_module
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    targets = args.targets or _discover_targets(args.a3m_dir)
-    if not targets:
-        raise SystemExit(f"no targets: nothing matched {args.a3m_dir}/*.a3m")
-    logger.info("extracting %d target(s): %s", len(targets), ", ".join(targets))
 
-    # Parse every a3m up front so a bad file fails fast, before loading models.
-    parsed = {}
+    # Target source priority: explicit --targets > --csv > all *.a3m in a3m_dir.
+    if args.targets:
+        targets = args.targets
+    elif args.csv:
+        targets = _targets_from_csv(args.csv)
+        logger.info("%d target(s) from csv %s", len(targets), args.csv)
+    else:
+        targets = _discover_targets(args.a3m_dir)
+    if not targets:
+        raise SystemExit("no targets (check --targets / --csv / a3m_dir)")
+
+    # Parse a3m up front; targets whose a3m is missing are skipped (not fatal).
+    parsed, missing = {}, []
     for t in targets:
         a3m = Path(args.a3m_dir) / f"{t}.a3m"
+        if not a3m.is_file():
+            missing.append(t)
+            continue
         _, seqs = parse_a3m(str(a3m))
         seqs = filter_msa(seqs)
         parsed[t] = seqs
         logger.info("  %s: depth=%d L=%d", t, len(seqs), len(seqs[0].replace("-", "")))
+    if missing:
+        logger.warning("skipped %d target(s) with no a3m in %s: %s",
+                       len(missing), args.a3m_dir, ", ".join(missing))
+    targets = [t for t in targets if t in parsed]
+    if not targets:
+        raise SystemExit(f"no target a3m found under {args.a3m_dir}")
+    logger.info("extracting %d target(s)", len(targets))
 
     # ── Pass A — real (Protenix trunk) ───────────────────────────────────────
     protenix = load_msa_module(args.protenix_ckpt, device)
@@ -258,7 +288,11 @@ def main():
 
     pe = sub.add_parser("extract", help="GPU: dump real + zero-shot npz")
     pe.add_argument("--targets", nargs="*", default=None,
-                    help="target names (a3m = <a3m_dir>/<target>.a3m); default: all *.a3m")
+                    help="explicit target names (a3m = <a3m_dir>/<target>.a3m); "
+                         "overrides --csv")
+    pe.add_argument("--csv", default=DEF_CSV,
+                    help="monomer_protein.csv (pdb_id,chain_id → pdb_id__chain_id); "
+                         "a3m-less targets are skipped. Used when --targets is empty.")
     pe.add_argument("--a3m_dir", default=DEF_A3M_DIR)
     pe.add_argument("--latent_fm_ckpt", default=DEF_LATENT_FM)
     pe.add_argument("--protenix_ckpt", default=DEF_PROTENIX)
