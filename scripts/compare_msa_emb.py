@@ -27,6 +27,8 @@ Commands:
   spread     CPU: decompose low diversity into sd_real / sd_gen / sd_seed per
              channel → distinguishes MODE COLLAPSE (training) from a
              NEAR-DETERMINISTIC model (sampling). CSV + per-channel npz + figure.
+  offset     CPU: does the generated per-target offset (protein identity) track
+             the real one, channel by channel? + sequence-length confound. npz.
 
 Usage
 -----
@@ -739,6 +741,87 @@ def spread(args):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Stage 4: offset diagnostic (CPU)
+#
+# The per-target offset α_i = mean over residues of the centred embedding — the
+# "which protein is this" component (the between-target variance). Does the
+# GENERATED offset track the REAL offset, channel by channel?
+#   off_real = mean_residue( centre(real) )              per target → (N, 128)
+#   off_gen  = mean_{seed,residue}( centre(gen) )         per target → (N, 128)
+# A high per-channel corr(off_real[:,c], off_gen[:,c]) over targets means that
+# channel carries protein identity in gen too; many low/negative channels mean
+# gen barely distinguishes proteins (matches a low between-target variance).
+# Confound: if off_gen (but not off_real) correlates with L, the model is using
+# sequence length as a cheap offset proxy.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _safe_corr(a, b):
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if a.std() < 1e-12 or b.std() < 1e-12:
+        return np.nan
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def offset(args):
+    targets = args.targets or _extracted_targets(args.out_base)
+    if len(targets) < 3:
+        raise SystemExit(f"need >=3 targets for a correlation, have {len(targets)}")
+    mu, sd = _testset_stats(args.out_base)
+
+    off_real, off_gen, Ls = [], [], []
+    for t in targets:
+        real, gen = _load_pair(args.out_base, t)
+        off_real.append(_center(real, mu, sd).mean(axis=0))         # (128,)
+        off_gen.append(_center(gen, mu, sd).mean(axis=(0, 1)))      # (128,)
+        Ls.append(real.shape[0])
+    off_real = np.stack(off_real)                                   # (N, 128)
+    off_gen = np.stack(off_gen)
+    L = np.array(Ls)
+
+    overall = _safe_corr(off_real.ravel(), off_gen.ravel())
+    corr = np.array([_safe_corr(off_real[:, c], off_gen[:, c]) for c in range(off_real.shape[1])])
+    valid = corr[~np.isnan(corr)]
+    cr_L = _safe_corr(off_real.mean(1), L)
+    cg_L = _safe_corr(off_gen.mean(1), L)
+
+    print(f"\n=== offset (target component α_i, {len(targets)} targets) ===")
+    print(f"  overall corr(off_real, off_gen)  {overall:+.3f}")
+    print(f"  per-channel corr: median {np.median(valid):+.2f}   "
+          f"neg {int((valid < 0).sum())}/{valid.size}   "
+          f"range {valid.min():+.2f} ~ {valid.max():+.2f}"
+          + (f"   (nan {np.isnan(corr).sum()})" if np.isnan(corr).any() else ""))
+    print(f"  L confound — corr with length:  real {cr_L:+.2f}   gen {cg_L:+.2f}"
+          + ("   ← gen leans on L, real doesn't" if abs(cg_L) - abs(cr_L) > 0.3 else ""))
+
+    npz = args.out or str(Path(args.out_base) / "offset_diag.npz")
+    np.savez_compressed(npz, targets=np.array(targets), channel=np.arange(corr.size),
+                        corr_per_channel=corr, off_real=off_real, off_gen=off_gen, L=L,
+                        overall=overall, corr_L_real=cr_L, corr_L_gen=cg_L)
+    logger.info("wrote %s", npz)
+
+    if not args.no_plot:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+            ax[0].scatter(off_real.ravel(), off_gen.ravel(), s=3, alpha=0.2)
+            ax[0].set_xlabel("off_real"); ax[0].set_ylabel("off_gen")
+            ax[0].set_title(f"offset scatter (overall r={overall:+.2f})")
+            ax[1].hist(valid, bins=30, color="tab:purple", alpha=0.8)
+            ax[1].axvline(np.median(valid), c="k", ls="--",
+                          label=f"median {np.median(valid):+.2f}")
+            ax[1].axvline(0, c="gray", ls=":")
+            ax[1].set_xlabel("per-channel corr"); ax[1].set_ylabel("channels")
+            ax[1].set_title("per-channel offset correlation"); ax[1].legend()
+            fig.tight_layout()
+            png = str(Path(npz).with_name("offset_diag.png"))
+            fig.savefig(png, dpi=150); logger.info("wrote %s", png)
+        except Exception as e:
+            logger.warning("plot skipped: %s", e)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -802,6 +885,14 @@ def main():
     ps.add_argument("--out", default=None, help="CSV path (npz/png written alongside)")
     ps.add_argument("--no_plot", action="store_true", help="skip the per-channel figure")
     ps.set_defaults(func=spread)
+
+    po = sub.add_parser("offset",
+                        help="CPU: does the generated per-target offset (protein "
+                             "identity α_i) track the real one, per channel? + L confound")
+    po.add_argument("--targets", nargs="*", default=None, help="default: all extracted")
+    po.add_argument("--out", default=None, help="npz path (png written alongside)")
+    po.add_argument("--no_plot", action="store_true", help="skip the figure")
+    po.set_defaults(func=offset)
 
     args = p.parse_args()
     args.func(args)
