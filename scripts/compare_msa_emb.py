@@ -762,6 +762,16 @@ def _safe_corr(a, b):
     return float(np.corrcoef(a, b)[0, 1])
 
 
+def _partial_corr(x, y, z):
+    """corr(x, y) after linearly removing z from both → "what the model knows
+    BEYOND z". z is controlled for (here z = sequence length L)."""
+    x, y, z = map(lambda v: np.asarray(v, float), (x, y, z))
+    Z = np.c_[np.ones_like(z), z]
+    rx = x - Z @ np.linalg.lstsq(Z, x, rcond=None)[0]
+    ry = y - Z @ np.linalg.lstsq(Z, y, rcond=None)[0]
+    return _safe_corr(rx, ry)
+
+
 def offset(args):
     targets = args.targets or _extracted_targets(args.out_base)
     if len(targets) < 3:
@@ -781,22 +791,30 @@ def offset(args):
     overall = _safe_corr(off_real.ravel(), off_gen.ravel())
     corr = np.array([_safe_corr(off_real[:, c], off_gen[:, c]) for c in range(off_real.shape[1])])
     valid = corr[~np.isnan(corr)]
-    cr_L = _safe_corr(off_real.mean(1), L)
-    cg_L = _safe_corr(off_gen.mean(1), L)
+    # Same axis (channel-mean) for the gen↔real and the L correlations, so they
+    # are comparable; then control for L to see what gen knows BEYOND length.
+    om, gm = off_real.mean(1), off_gen.mean(1)
+    corr_mean = _safe_corr(om, gm)
+    partial = _partial_corr(om, gm, L)
+    cr_L = _safe_corr(om, L)
+    cg_L = _safe_corr(gm, L)
 
     print(f"\n=== offset (target component α_i, {len(targets)} targets) ===")
-    print(f"  overall corr(off_real, off_gen)  {overall:+.3f}")
+    print(f"  corr(off_real, off_gen)   ravel {overall:+.3f}   channel-mean {corr_mean:+.3f}")
     print(f"  per-channel corr: median {np.median(valid):+.2f}   "
           f"neg {int((valid < 0).sum())}/{valid.size}   "
           f"range {valid.min():+.2f} ~ {valid.max():+.2f}"
           + (f"   (nan {np.isnan(corr).sum()})" if np.isnan(corr).any() else ""))
-    print(f"  L confound — corr with length:  real {cr_L:+.2f}   gen {cg_L:+.2f}"
-          + ("   ← gen leans on L, real doesn't" if abs(cg_L) - abs(cr_L) > 0.3 else ""))
+    print(f"  L confound (channel-mean):  real {cr_L:+.2f}   gen {cg_L:+.2f}"
+          f"   → shared-L floor {cr_L*cg_L:+.3f}")
+    print(f"  partial corr | L  {partial:+.3f}   ← what gen knows BEYOND length"
+          + ("   (≈0: gen offset is basically just L)" if abs(partial) < 0.1 else ""))
 
     npz = args.out or str(Path(args.out_base) / "offset_diag.npz")
     np.savez_compressed(npz, targets=np.array(targets), channel=np.arange(corr.size),
                         corr_per_channel=corr, off_real=off_real, off_gen=off_gen, L=L,
-                        overall=overall, corr_L_real=cr_L, corr_L_gen=cg_L)
+                        overall=overall, corr_mean=corr_mean, partial_corr_L=partial,
+                        corr_L_real=cr_L, corr_L_gen=cg_L)
     logger.info("wrote %s", npz)
 
     if not args.no_plot:

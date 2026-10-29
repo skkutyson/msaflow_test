@@ -351,6 +351,119 @@ def _verdict(means, div_tol):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# CPU: offset ladder — MEASURE (not predict) how the per-target offset α_i affects
+# cosine. Take the FM residue-variation dev = fc − mean_residue(fc) (offset removed)
+# and splice different offset estimates back on, then measure cos to real:
+#   A_gen    fc as-is                       (FM's own offset)
+#   B_zero   dev                            (offset = 0)
+#   C_Lpred  off_from_L + dev               ★ offset from a per-channel L-regression
+#   D_ridge  off_from_ESM + dev             (ridge e→offset)
+#   E_oracle real's own offset + dev        (upper bound)
+# If C ≈ E, the offset problem is a one-line length correction. All train-fit
+# quantities (MU/SD, L-coef, ridge) come from TRAIN targets only (K-fold).
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _lfeat(ls):
+    ls = np.asarray(ls, float)
+    return np.c_[np.ones_like(ls), ls, ls ** 2, np.log(ls)]    # [1, L, L², logL]
+
+
+def offset_ladder(args):
+    from sklearn.linear_model import RidgeCV
+
+    base = args.out_base
+    pool = args.targets or _discover(base)
+    targets = [t for t in pool if cme._real_npz(base, t).exists()
+               and cme._lfm_npz(base, t).exists()]
+    if len(targets) < 3:
+        raise SystemExit(f"need >=3 targets, have {len(targets)}")
+    have_esm = all(_esm_npz(base, t).exists() for t in targets)
+    if not have_esm:
+        logger.warning("some esm npz missing → skipping the D_ridge rung "
+                       "(run cache-esm to enable)")
+
+    reals, gens, Ls, offe = {}, {}, {}, {}
+    for t in targets:
+        reals[t] = np.load(cme._real_npz(base, t))["real"]
+        gens[t] = np.load(cme._lfm_npz(base, t))["zeroshot"]
+        Ls[t] = reals[t].shape[0]
+        if have_esm:
+            offe[t] = np.load(_esm_npz(base, t))["esm"].mean(axis=0)   # (1280,)
+
+    # length-balanced K-fold (same scheme as run()).
+    k = min(args.kfold, len(targets))
+    by_len = sorted(targets, key=lambda t: Ls[t])
+    folds = [[] for _ in range(k)]
+    for idx, t in enumerate(by_len):
+        f = idx % k
+        if (idx // k) % 2 == 1:
+            f = k - 1 - f
+        folds[f].append(t)
+
+    rungs = ["A_gen", "B_zero", "C_Lpred", "D_ridge", "E_oracle"]
+    acc = {r: [] for r in rungs}
+    pL, pR, pT = [], [], []                                    # offset recovery: L-pred, ridge-pred, true
+    for test_ts in folds:
+        train_ts = [t for t in targets if t not in set(test_ts)]
+        if not train_ts or not test_ts:
+            continue
+        mu, sd = cme.channel_stats([reals[t] for t in train_ts])
+        off_true = {t: cme._center(reals[t], mu, sd).mean(axis=0) for t in targets}  # (128,)
+
+        Ytr = np.stack([off_true[t] for t in train_ts])        # (n,128)
+        coefL, *_ = np.linalg.lstsq(_lfeat([Ls[t] for t in train_ts]), Ytr, rcond=None)  # (4,128)
+        ridge = (RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0]).fit(
+                 np.stack([offe[t] for t in train_ts]), Ytr) if have_esm else None)
+
+        for t in test_ts:
+            rc = cme._center(reals[t], mu, sd)                 # (L,128)
+            fc = cme._center(gens[t], mu, sd)                  # (K,L,128)
+            dev = fc - fc.mean(axis=1, keepdims=True)          # (K,L,128) offset removed
+            off_L = (_lfeat([Ls[t]]) @ coefL)[0]               # (128,)
+            cand = {"A_gen": fc, "B_zero": dev,
+                    "C_Lpred": off_L[None, None] + dev,
+                    "E_oracle": off_true[t][None, None] + dev}
+            pL.append(off_L); pT.append(off_true[t])
+            if ridge is not None:
+                off_R = ridge.predict(offe[t][None])[0]
+                cand["D_ridge"] = off_R[None, None] + dev
+                pR.append(off_R)
+            for r in rungs:
+                if r in cand:
+                    cc = cme._cos_lastdim(cand[r], rc[None]).mean(axis=-1)   # (K,)
+                    acc[r].append(float(cc.max()))             # best-of-K
+
+    # ── report ──
+    print("\n=== offset ladder (mean best-of-K cos to real) ===")
+    for r in rungs:
+        if acc[r]:
+            print(f"  {r:9s} {np.mean(acc[r]):+.4f}")
+    if acc["C_Lpred"] and acc["E_oracle"]:
+        gap = np.mean(acc["E_oracle"]) - np.mean(acc["C_Lpred"])
+        base_gap = np.mean(acc["E_oracle"]) - np.mean(acc["B_zero"])
+        frac = (1 - gap / base_gap) * 100 if base_gap > 1e-9 else float("nan")
+        print(f"\n  C_Lpred recovers {frac:.0f}% of the oracle offset gain "
+              f"(E−C = {gap:+.4f}, E−B = {base_gap:+.4f})")
+        print("  → high % means the offset problem is a one-line length correction.")
+
+    P, T = np.stack(pL), np.stack(pT)
+    print("\n=== offset recovery (pred vs true, over test targets) ===")
+    print(f"  L-regression : ravel {cme._safe_corr(P.ravel(), T.ravel()):+.3f}   "
+          f"channel-mean {cme._safe_corr(P.mean(1), T.mean(1)):+.3f}")
+    if pR:
+        R = np.stack(pR)
+        print(f"  ridge e→off  : ravel {cme._safe_corr(R.ravel(), T.ravel()):+.3f}   "
+              f"channel-mean {cme._safe_corr(R.mean(1), T.mean(1)):+.3f}")
+
+    out = args.out or str(Path(base) / "offset_ladder.npz")
+    np.savez_compressed(out, rungs=np.array([r for r in rungs if acc[r]]),
+                        ladder=np.array([np.mean(acc[r]) for r in rungs if acc[r]]),
+                        off_L_pred=P, off_ridge_pred=(np.stack(pR) if pR else np.empty(0)),
+                        off_true=T)
+    logger.info("wrote %s", out)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -386,6 +499,14 @@ def main():
     pr.add_argument("--csv_out", default=None)
     pr.add_argument("--plot_out", default=None)
     pr.set_defaults(func=run)
+
+    pl = sub.add_parser("offset-ladder",
+                        help="CPU: measure how the per-target offset (L-regression / "
+                             "ridge / oracle) changes cos to real — is it a length fix?")
+    pl.add_argument("--targets", nargs="*", default=None)
+    pl.add_argument("--kfold", type=int, default=5)
+    pl.add_argument("--out", default=None, help="npz path")
+    pl.set_defaults(func=offset_ladder)
 
     args = p.parse_args()
     args.func(args)
