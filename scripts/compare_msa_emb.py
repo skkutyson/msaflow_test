@@ -508,6 +508,17 @@ def plot_all(args):
     logger.info("DATASET mean: %s", {k: round(v, 4) for k, v in agg.items()})
     logger.info("★ best = %s (cos_best=%.4f)", best, met[best]["cos_best"])
 
+    # Per-target CSV (same numbers as the log) — e.g. to join against folding
+    # TM/lDDT. One row per target, sorted by cos_best.
+    csv_path = args.csv or str(Path(args.out_base) / f"compare_all_{args.method}_metrics.csv")
+    cols = ["target", "L", "cos_best", "cos_mean", "diversity", "cos_null"]
+    with open(csv_path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols); w.writeheader()
+        for t in sorted(targets, key=lambda t: -met[t]["cos_best"]):
+            w.writerow({"target": t, "L": pairs[t][0].shape[0], **{
+                k: ("" if met[t][k] is None else met[t][k]) for k in cols[2:]}})
+    logger.info("wrote %s (%d targets)", csv_path, len(targets))
+
     # Common axes: one PCA fit on the pooled CENTRED real manifold, reused for every
     # panel — so "is gen inside the real manifold or collapsed to the centre?" is
     # comparable across the grid. (t-SNE has no shared transform → per-panel fit.)
@@ -712,7 +723,10 @@ def main():
     pa.add_argument("--targets", nargs="*", default=None, help="default: all extracted")
     pa.add_argument("--method", choices=["pca", "tsne"], default="pca")
     pa.add_argument("--ncol", type=int, default=4)
-    pa.add_argument("--out", default=None)
+    pa.add_argument("--out", default=None, help="grid PNG path")
+    pa.add_argument("--csv", default=None,
+                    help="per-target metrics CSV path (default: "
+                         "<out_base>/compare_all_<method>_metrics.csv)")
     pa.add_argument("--seed", type=int, default=0)
     pa.set_defaults(func=plot_all)
 
