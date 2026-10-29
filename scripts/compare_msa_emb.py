@@ -24,6 +24,9 @@ Commands:
              by cos_best. Reports cos_best / cos_mean / diversity / cos_null
              (see the "Similarity metrics" section for why seed-mean cosine is
              wrong and these four replace it).
+  spread     CPU: decompose low diversity into sd_real / sd_gen / sd_seed per
+             channel → distinguishes MODE COLLAPSE (training) from a
+             NEAR-DETERMINISTIC model (sampling). CSV + per-channel npz + figure.
 
 Usage
 -----
@@ -543,6 +546,126 @@ def plot_all(args):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Stage 3: spread diagnostic (CPU)
+#
+# Low diversity has two causes with OPPOSITE fixes, indistinguishable from the
+# diversity scalar alone. Decompose the centred generated z along both axes:
+#
+#   sd_real  r.std(axis=residue)              per-channel real spread. Since MU/SD
+#                                             are fit on real, pooled ≈ 1.0 → the
+#                                             free reference ("how wide is real").
+#   sd_gen   mean_seed(g).std(axis=residue)   how the generated embedding VARIES
+#                                             along the sequence (per channel).
+#   sd_seed  g.std(axis=seed).mean(residue)   seed-to-seed spread at a residue —
+#                                             this is what `diversity` summarises.
+#
+# sd_gen tells the two apart (real SD = 1.0 reference):
+#   sd_gen ≈ 1  generation is as wide as real but seeds cluster → model near
+#               DETERMINISTIC given ESM2 → fix the SAMPLING (noise schedule /
+#               seed injection / ODE steps).
+#   sd_gen ≈ .2 generation collapsed toward MU → MODE COLLAPSE → fix the TRAINING
+#               objective (FM loss favouring the mean).
+#   sd_gen > 1  over-diffusion / scale bug (unlikely).
+# Per-channel 128-vectors also show whether a FEW channels died or ALL shrank
+# uniformly (→ npz, for the next clue: what the dead channels encode).
+# ──────────────────────────────────────────────────────────────────────────────
+
+def spread(args):
+    targets = args.targets or _extracted_targets(args.out_base)
+    if not targets:
+        raise SystemExit(f"no extracted targets under {args.out_base}")
+    # One shared reference: full test-set MU/SD (so real z-scored → per-channel ≈1).
+    mu, sd = _testset_stats(args.out_base)
+
+    rows, ch_real, ch_gen, ch_seed = [], [], [], []
+    for t in targets:
+        real, gen = _load_pair(args.out_base, t)            # (L,128), (K,L,128)
+        rc = _center(real, mu, sd)                          # (L,128)
+        gc = _center(gen, mu, sd)                           # (K,L,128)
+        sd_real = rc.std(axis=0)                            # (128,)
+        sd_gen = gc.mean(axis=0).std(axis=0)                # (128,) spread along residue
+        sd_seed = (gc.std(axis=0).mean(axis=0) if gc.shape[0] > 1
+                   else np.zeros(gc.shape[-1]))             # (128,) spread across seeds
+        ch_real.append(sd_real); ch_gen.append(sd_gen); ch_seed.append(sd_seed)
+        rows.append({"target": t, "L": real.shape[0],
+                     "sd_real": float(sd_real.mean()),
+                     "sd_gen": float(sd_gen.mean()),
+                     "sd_seed": float(sd_seed.mean()),
+                     "diversity": seed_diversity(gen, mu, sd)})
+
+    # Dataset per-channel means (128,) — averaged over targets.
+    chan_real = np.mean(ch_real, axis=0)
+    chan_gen = np.mean(ch_gen, axis=0)
+    chan_seed = np.mean(ch_seed, axis=0)
+
+    # ── CSV (per target) ──
+    csv_path = args.out or str(Path(args.out_base) / "spread_diag.csv")
+    cols = ["target", "L", "sd_real", "sd_gen", "sd_seed", "diversity"]
+    with open(csv_path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols); w.writeheader()
+        for r in sorted(rows, key=lambda r: r["sd_gen"]):
+            w.writerow(r)
+    logger.info("wrote %s (%d targets)", csv_path, len(rows))
+
+    # ── per-channel 128-vectors (for 'which channels died') ──
+    npz = str(Path(csv_path).with_name("spread_diag_channels.npz"))
+    np.savez_compressed(npz, channel=np.arange(chan_gen.size),
+                        sd_real=chan_real, sd_gen=chan_gen, sd_seed=chan_seed,
+                        targets=np.array(targets),
+                        sd_gen_per_target=np.stack(ch_gen),
+                        sd_seed_per_target=np.stack(ch_seed))
+    logger.info("wrote %s (per-channel vectors)", npz)
+
+    # ── dataset summary ──
+    m_real, m_gen, m_seed = chan_real.mean(), chan_gen.mean(), chan_seed.mean()
+    div_mean = float(np.mean([r["diversity"] for r in rows]))
+    print("\n=== spread (dataset mean, centred; real per-channel SD ≡ 1.0 ref) ===")
+    print(f"  sd_real  {m_real:.3f}   (sanity: should be ≈1.0)")
+    print(f"  sd_gen   {m_gen:.3f}   generation spread along residue")
+    print(f"  sd_seed  {m_seed:.3f}   seed-to-seed spread  (= diversity/√2 ≈ {div_mean/np.sqrt(2):.3f})")
+    print(f"  diversity {div_mean:.3f}  (cross-check of sd_seed)")
+
+    n_dead = int((chan_gen < 0.3).sum())
+    print(f"  channels with sd_gen<0.3: {n_dead}/{chan_gen.size}  "
+          f"({'a FEW channels died' if 0 < n_dead < chan_gen.size // 2 else 'uniform shrink' if n_dead else 'none dead'})")
+
+    print("\n=== cause (from sd_gen vs real=1.0) ===")
+    if m_gen > 1.2:
+        print(f"  sd_gen={m_gen:.2f} > 1 → OVER-DIFFUSION / scale bug (check normalisation).")
+    elif m_gen >= 0.8:
+        print(f"  sd_gen={m_gen:.2f} ≈ 1 → generation as wide as real but seeds cluster "
+              f"(sd_seed={m_seed:.2f}). Model near-DETERMINISTIC given ESM2 → fix SAMPLING "
+              f"(noise schedule / seed-injection point / ODE steps / temperature).")
+    elif m_gen < 0.4:
+        print(f"  sd_gen={m_gen:.2f} ≪ 1 → generation CONTRACTED toward MU → MODE COLLAPSE "
+              f"→ fix the TRAINING objective (FM loss converging to the mean).")
+    else:
+        print(f"  sd_gen={m_gen:.2f} (0.4–0.8) → partial contraction; inspect per-channel "
+              f"npz — are specific channels dead or all shrunk?")
+
+    # ── per-channel plot ──
+    if not args.no_plot:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            order = np.argsort(chan_gen)                    # sort channels by sd_gen
+            fig, ax = plt.subplots(figsize=(9, 5))
+            ax.plot(chan_real[order], label="sd_real (≈1)", c="tab:blue")
+            ax.plot(chan_gen[order], label="sd_gen (vs residue)", c="tab:orange")
+            ax.plot(chan_seed[order], label="sd_seed (vs seed)", c="tab:green")
+            ax.axhline(1.0, ls=":", c="gray", lw=0.8)
+            ax.set_xlabel("channel (sorted by sd_gen)"); ax.set_ylabel("per-channel SD (centred)")
+            ax.set_title(f"spread per channel — sd_gen̄={m_gen:.2f} sd_seed̄={m_seed:.2f}")
+            ax.legend(loc="best")
+            fig.tight_layout()
+            png = str(Path(csv_path).with_name("spread_diag.png"))
+            fig.savefig(png, dpi=150); logger.info("wrote %s", png)
+        except Exception as e:
+            logger.warning("plot skipped: %s", e)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -592,6 +715,15 @@ def main():
     pa.add_argument("--out", default=None)
     pa.add_argument("--seed", type=int, default=0)
     pa.set_defaults(func=plot_all)
+
+    ps = sub.add_parser("spread",
+                        help="CPU: decompose low diversity → sd_real/sd_gen/sd_seed "
+                             "per channel; tells mode-collapse (training) from "
+                             "near-deterministic (sampling)")
+    ps.add_argument("--targets", nargs="*", default=None, help="default: all extracted")
+    ps.add_argument("--out", default=None, help="CSV path (npz/png written alongside)")
+    ps.add_argument("--no_plot", action="store_true", help="skip the per-channel figure")
+    ps.set_defaults(func=spread)
 
     args = p.parse_args()
     args.func(args)
