@@ -181,6 +181,15 @@ def _center(x, mu, sd, zscore=True):
     return (x - mu) / sd if zscore else (x - mu)
 
 
+def _center_within(x, mu, sd, zscore=True):
+    """Channel-centre, THEN remove each example's per-residue mean (the target
+    component α_i). What's left is the residue-INTERNAL pattern only, so cosine on
+    it answers "does gen match the sequence profile, not just which protein it is".
+    """
+    xc = _center(x, mu, sd, zscore)
+    return xc - xc.mean(axis=-2, keepdims=True)         # subtract mean over residue axis
+
+
 def _cos_lastdim(a, b):
     """Cosine over the last (channel) axis, broadcasting the rest."""
     num = (a * b).sum(axis=-1)
@@ -188,11 +197,17 @@ def _cos_lastdim(a, b):
     return num / den
 
 
-def per_seed_cos(real, zeroshot, mu, sd, zscore=True):
-    """Per-seed, per-residue cosine on centred vectors → (K,) one value per seed."""
-    zc = _center(real, mu, sd, zscore)                  # (L, 128)
-    gc = _center(zeroshot, mu, sd, zscore)              # (K, L, 128)
-    return _cos_lastdim(gc, zc[None]).mean(axis=-1)     # (K,)
+def per_seed_cos_perres(real, zeroshot, mu, sd, zscore=True, within=False):
+    """Per-seed, per-residue cosine on centred vectors → (K, L)."""
+    ctr = _center_within if within else _center
+    zc = ctr(real, mu, sd, zscore)                      # (L, 128)
+    gc = ctr(zeroshot, mu, sd, zscore)                  # (K, L, 128)
+    return _cos_lastdim(gc, zc[None])                   # (K, L)
+
+
+def per_seed_cos(real, zeroshot, mu, sd, zscore=True, within=False):
+    """Per-seed cosine (residue-averaged) → (K,) one value per seed."""
+    return per_seed_cos_perres(real, zeroshot, mu, sd, zscore, within).mean(axis=-1)
 
 
 def seed_diversity(zeroshot, mu, sd, zscore=True):
@@ -216,20 +231,37 @@ def seed_diversity(zeroshot, mu, sd, zscore=True):
     return d / n
 
 
-def null_cos(zeroshot, real_other, mu, sd, zscore=True):
-    """Lower-bound: centred gen seeds vs a DIFFERENT protein's centred real."""
-    L = min(zeroshot.shape[1], real_other.shape[0])
-    gc = _center(zeroshot[:, :L], mu, sd, zscore)       # (K, L, 128)
-    oc = _center(real_other[:L], mu, sd, zscore)        # (L, 128)
-    return float(_cos_lastdim(gc, oc[None]).mean())
+def null_cos(zeroshot, real_others, mu, sd, zscore=True):
+    """Lower-bound: centred gen seeds vs DIFFERENT proteins' centred real, averaged.
+
+    `real_others` is one (L,128) array or a list of them. Averaging over ~20 other
+    proteins makes the null stable enough to use PER TARGET (a single random
+    partner is not reproducible when the target set changes).
+    """
+    if not isinstance(real_others, (list, tuple)):
+        real_others = [real_others]
+    vals = []
+    for ro in real_others:
+        L = min(zeroshot.shape[1], ro.shape[0])
+        gc = _center(zeroshot[:, :L], mu, sd, zscore)
+        oc = _center(ro[:L], mu, sd, zscore)
+        vals.append(float(_cos_lastdim(gc, oc[None]).mean()))
+    return float(np.mean(vals)) if vals else None
 
 
 def compute_metrics(real, zeroshot, mu, sd, real_other=None, zscore=True):
-    """Return the four-number report dict for one target."""
-    cos_k = per_seed_cos(real, zeroshot, mu, sd, zscore)
+    """Per-target report dict. cos_within strips the target component (per-residue
+    mean) → residue-internal match; cos_p10 / cos_frac_neg expose the per-residue
+    tail that the residue-average hides."""
+    cpr = per_seed_cos_perres(real, zeroshot, mu, sd, zscore)        # (K, L)
+    cos_k = cpr.mean(axis=-1)                                        # (K,)
+    cos_within_k = per_seed_cos(real, zeroshot, mu, sd, zscore, within=True)
     return {
         "cos_best": float(cos_k.max()),
         "cos_mean": float(cos_k.mean()),
+        "cos_within": float(cos_within_k.max()),                    # best-of-K, within
+        "cos_p10": float(np.percentile(cpr, 10)),                   # weak-residue tail
+        "cos_frac_neg": float((cpr < 0).mean()),                    # fraction anti-aligned
         "diversity": seed_diversity(zeroshot, mu, sd, zscore),
         "cos_null": None if real_other is None
         else null_cos(zeroshot, real_other, mu, sd, zscore),
@@ -481,15 +513,20 @@ def plot_all(args):
     # centred metric, the common PCA axes below, and plot / inline-extract.
     mu, sd = _testset_stats(args.out_base, targets)
 
-    # Null baseline: pair each target with the NEXT target's real (cyclic), so the
-    # lower bound uses a genuinely different protein.
+    # Null baseline: average over N_NULL seeded-random OTHER proteins (not one
+    # cyclic neighbour — a single partner flips when the target set changes, making
+    # per-target cos_null irreproducible). Averaging ~20 stabilises it per target.
     order = list(targets)
-    others = {t: order[(i + 1) % len(order)] for i, t in enumerate(order)} if len(order) > 1 else {}
+    null_rng = np.random.default_rng(args.seed)
+    n_null = min(args.n_null, len(order) - 1)
+    others = ({t: null_rng.choice([u for u in order if u != t], size=n_null,
+                                  replace=False).tolist() for t in order}
+              if len(order) > 1 else {})
 
     met = {}
     for t in targets:
         real, zeroshot = pairs[t]
-        real_other = pairs[others[t]][0] if t in others else None
+        real_other = [pairs[u][0] for u in others[t]] if t in others else None
         met[t] = compute_metrics(real, zeroshot, mu, sd, real_other=real_other)
 
     # ★ picks on cos_best (paper protocol), NOT the old seed-mean cosine.
@@ -511,7 +548,8 @@ def plot_all(args):
     # Per-target CSV (same numbers as the log) — e.g. to join against folding
     # TM/lDDT. One row per target, sorted by cos_best.
     csv_path = args.csv or str(Path(args.out_base) / f"compare_all_{args.method}_metrics.csv")
-    cols = ["target", "L", "cos_best", "cos_mean", "diversity", "cos_null"]
+    cols = ["target", "L", "cos_best", "cos_mean", "cos_within",
+            "cos_p10", "cos_frac_neg", "diversity", "cos_null"]
     with open(csv_path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols); w.writeheader()
         for t in sorted(targets, key=lambda t: -met[t]["cos_best"]):
@@ -562,23 +600,22 @@ def plot_all(args):
 # Low diversity has two causes with OPPOSITE fixes, indistinguishable from the
 # diversity scalar alone. Decompose the centred generated z along both axes:
 #
-#   sd_real  r.std(axis=residue)              per-channel real spread. Since MU/SD
-#                                             are fit on real, pooled ≈ 1.0 → the
-#                                             free reference ("how wide is real").
-#   sd_gen   mean_seed(g).std(axis=residue)   how the generated embedding VARIES
-#                                             along the sequence (per channel).
-#   sd_seed  g.std(axis=seed).mean(residue)   seed-to-seed spread at a residue —
-#                                             this is what `diversity` summarises.
+#   sd_real  real WITHIN-target spread per channel. NB this is NOT 1.0: pooled SD
+#            = 1.0 splits into within-target + between-target, so sd_real ≈ 0.88
+#            and the reference is this MEASURED value, not 1.
+#   sd_gen   how the seed-mean generated embedding VARIES along the sequence.
+#   sd_seed  seed-to-seed spread (unbiased, ddof=1) — what `diversity` summarises.
 #
-# sd_gen tells the two apart (real SD = 1.0 reference):
-#   sd_gen ≈ 1  generation is as wide as real but seeds cluster → model near
-#               DETERMINISTIC given ESM2 → fix the SAMPLING (noise schedule /
-#               seed injection / ODE steps).
-#   sd_gen ≈ .2 generation collapsed toward MU → MODE COLLAPSE → fix the TRAINING
+# The RATIO sd_gen / sd_real tells the two causes apart:
+#   ratio ≈ 1   generation as wide as real but seeds cluster → model near
+#               DETERMINISTIC given ESM2 → fix the SAMPLING (temperature / noise
+#               schedule / seed injection / ODE steps).
+#   ratio ≪ 1   generation collapsed toward MU → MODE COLLAPSE → fix the TRAINING
 #               objective (FM loss favouring the mean).
-#   sd_gen > 1  over-diffusion / scale bug (unlikely).
-# Per-channel 128-vectors also show whether a FEW channels died or ALL shrank
-# uniformly (→ npz, for the next clue: what the dead channels encode).
+#   ratio > 1   over-diffusion / scale bug (unlikely).
+# Also reported: between-target variance (does gen distinguish proteins at all?)
+# and per-channel 128-vectors (a FEW channels dead vs ALL shrank → npz).
+# Variances are accumulated and sqrt-ed once (averaging SDs underestimates).
 # ──────────────────────────────────────────────────────────────────────────────
 
 def spread(args):
@@ -588,26 +625,42 @@ def spread(args):
     # One shared reference: full test-set MU/SD (so real z-scored → per-channel ≈1).
     mu, sd = _testset_stats(args.out_base)
 
-    rows, ch_real, ch_gen, ch_seed = [], [], [], []
+    # Accumulate VARIANCES (not SDs): averaging SDs then is biased low (Jensen),
+    # and with K=4 seeds the seed variance needs ddof=1 (E[s²]=0.75σ² otherwise).
+    # sqrt only once, at the very end.
+    rows, ch_var_real, ch_var_gen, ch_var_seed = [], [], [], []
+    pooled_real, pooled_gen = [], []                        # for between-target variance
     for t in targets:
         real, gen = _load_pair(args.out_base, t)            # (L,128), (K,L,128)
         rc = _center(real, mu, sd)                          # (L,128)
         gc = _center(gen, mu, sd)                           # (K,L,128)
-        sd_real = rc.std(axis=0)                            # (128,)
-        sd_gen = gc.mean(axis=0).std(axis=0)                # (128,) spread along residue
-        sd_seed = (gc.std(axis=0).mean(axis=0) if gc.shape[0] > 1
-                   else np.zeros(gc.shape[-1]))             # (128,) spread across seeds
-        ch_real.append(sd_real); ch_gen.append(sd_gen); ch_seed.append(sd_seed)
+        gbar = gc.mean(axis=0)                              # (L,128) seed mean
+        var_real = rc.var(axis=0)                           # (128,) along residue
+        var_gen = gbar.var(axis=0)                          # (128,) along residue
+        var_seed = (gc.var(axis=0, ddof=1).mean(axis=0) if gc.shape[0] > 1
+                    else np.zeros(gc.shape[-1]))            # (128,) across seeds, unbiased
+        ch_var_real.append(var_real); ch_var_gen.append(var_gen); ch_var_seed.append(var_seed)
+        pooled_real.append(rc); pooled_gen.append(gbar)
         rows.append({"target": t, "L": real.shape[0],
-                     "sd_real": float(sd_real.mean()),
-                     "sd_gen": float(sd_gen.mean()),
-                     "sd_seed": float(sd_seed.mean()),
+                     "sd_real": float(np.sqrt(var_real.mean())),
+                     "sd_gen": float(np.sqrt(var_gen.mean())),
+                     "sd_seed": float(np.sqrt(var_seed.mean())),
                      "diversity": seed_diversity(gen, mu, sd)})
 
-    # Dataset per-channel means (128,) — averaged over targets.
-    chan_real = np.mean(ch_real, axis=0)
-    chan_gen = np.mean(ch_gen, axis=0)
-    chan_seed = np.mean(ch_seed, axis=0)
+    # Dataset per-channel WITHIN-target variance (mean over targets), then → SD.
+    chan_var_real = np.mean(ch_var_real, axis=0)            # (128,)
+    chan_var_gen = np.mean(ch_var_gen, axis=0)
+    chan_var_seed = np.mean(ch_var_seed, axis=0)
+    chan_real = np.sqrt(chan_var_real)                     # (128,) per-channel SD
+    chan_gen = np.sqrt(chan_var_gen)
+    chan_seed = np.sqrt(chan_var_seed)
+
+    # Between-target variance (law of total variance: total = within + between) —
+    # does generated z even distinguish one protein from another?
+    tot_var_real = np.concatenate(pooled_real, axis=0).var(axis=0)   # (128,)
+    tot_var_gen = np.concatenate(pooled_gen, axis=0).var(axis=0)
+    between_real = float(max(tot_var_real.mean() - chan_var_real.mean(), 0.0))
+    between_gen = float(max(tot_var_gen.mean() - chan_var_gen.mean(), 0.0))
 
     # ── CSV (per target) ──
     csv_path = args.out or str(Path(args.out_base) / "spread_diag.csv")
@@ -623,36 +676,45 @@ def spread(args):
     np.savez_compressed(npz, channel=np.arange(chan_gen.size),
                         sd_real=chan_real, sd_gen=chan_gen, sd_seed=chan_seed,
                         targets=np.array(targets),
-                        sd_gen_per_target=np.stack(ch_gen),
-                        sd_seed_per_target=np.stack(ch_seed))
+                        sd_gen_per_target=np.sqrt(np.stack(ch_var_gen)),
+                        sd_seed_per_target=np.sqrt(np.stack(ch_var_seed)))
     logger.info("wrote %s (per-channel vectors)", npz)
 
     # ── dataset summary ──
-    m_real, m_gen, m_seed = chan_real.mean(), chan_gen.mean(), chan_seed.mean()
-    div_mean = float(np.mean([r["diversity"] for r in rows]))
-    print("\n=== spread (dataset mean, centred; real per-channel SD ≡ 1.0 ref) ===")
-    print(f"  sd_real  {m_real:.3f}   (sanity: should be ≈1.0)")
-    print(f"  sd_gen   {m_gen:.3f}   generation spread along residue")
+    # RMS over channels = sqrt(mean variance) — the unbiased dataset scalar.
+    m_real = float(np.sqrt(chan_var_real.mean()))
+    m_gen = float(np.sqrt(chan_var_gen.mean()))
+    m_seed = float(np.sqrt(chan_var_seed.mean()))
+    r = m_gen / (m_real + 1e-9)                             # ratio vs measured real
+    div_mean = float(np.mean([r_["diversity"] for r_ in rows]))
+    print("\n=== spread (dataset RMS over channels, centred) ===")
+    print(f"  sd_real  {m_real:.3f}   WITHIN-target SD (pooled=1.0; between-target "
+          f"{1 - m_real**2:+.3f} excluded)")
+    print(f"  sd_gen   {m_gen:.3f}   generation spread along residue  (sd_gen/sd_real = {r:.2f})")
     print(f"  sd_seed  {m_seed:.3f}   seed-to-seed spread  (= diversity/√2 ≈ {div_mean/np.sqrt(2):.3f})")
-    print(f"  diversity {div_mean:.3f}  (cross-check of sd_seed)")
+    print(f"  diversity {div_mean:.3f}  (cross-check of sd_seed, now ddof=1-consistent)")
+    print(f"  between-target var: real {between_real:.3f}  gen {between_gen:.3f}  "
+          f"({between_gen/(between_real+1e-9)*100:.0f}% of real — does gen tell proteins apart?)")
 
-    n_dead = int((chan_gen < 0.3).sum())
-    print(f"  channels with sd_gen<0.3: {n_dead}/{chan_gen.size}  "
+    # Dead channel = gen SD below 30% of THIS channel's real SD (not an absolute 0.3).
+    dead = chan_gen < 0.3 * chan_real
+    n_dead = int(dead.sum())
+    print(f"  channels with sd_gen<0.3·sd_real: {n_dead}/{chan_gen.size}  "
           f"({'a FEW channels died' if 0 < n_dead < chan_gen.size // 2 else 'uniform shrink' if n_dead else 'none dead'})")
 
-    print("\n=== cause (from sd_gen vs real=1.0) ===")
-    if m_gen > 1.2:
-        print(f"  sd_gen={m_gen:.2f} > 1 → OVER-DIFFUSION / scale bug (check normalisation).")
-    elif m_gen >= 0.8:
-        print(f"  sd_gen={m_gen:.2f} ≈ 1 → generation as wide as real but seeds cluster "
+    print("\n=== cause (from sd_gen / sd_real ratio) ===")
+    if r > 1.2:
+        print(f"  ratio={r:.2f} > 1 → OVER-DIFFUSION / scale bug (check normalisation).")
+    elif r >= 0.8:
+        print(f"  ratio={r:.2f} ≈ 1 → generation as wide as real but seeds cluster "
               f"(sd_seed={m_seed:.2f}). Model near-DETERMINISTIC given ESM2 → fix SAMPLING "
-              f"(noise schedule / seed-injection point / ODE steps / temperature).")
-    elif m_gen < 0.4:
-        print(f"  sd_gen={m_gen:.2f} ≪ 1 → generation CONTRACTED toward MU → MODE COLLAPSE "
+              f"(temperature / noise schedule / seed-injection point / ODE steps).")
+    elif r < 0.4:
+        print(f"  ratio={r:.2f} ≪ 1 → generation CONTRACTED toward MU → MODE COLLAPSE "
               f"→ fix the TRAINING objective (FM loss converging to the mean).")
     else:
-        print(f"  sd_gen={m_gen:.2f} (0.4–0.8) → partial contraction; inspect per-channel "
-              f"npz — are specific channels dead or all shrunk?")
+        print(f"  ratio={r:.2f} (0.4–0.8) → partial contraction; could be the T=0.5 "
+              f"sampling temperature — sweep T before blaming training. Check per-channel npz.")
 
     # ── per-channel plot ──
     if not args.no_plot:
@@ -662,10 +724,10 @@ def spread(args):
             import matplotlib.pyplot as plt
             order = np.argsort(chan_gen)                    # sort channels by sd_gen
             fig, ax = plt.subplots(figsize=(9, 5))
-            ax.plot(chan_real[order], label="sd_real (≈1)", c="tab:blue")
+            ax.plot(chan_real[order], label=f"sd_real (RMS {m_real:.2f})", c="tab:blue")
             ax.plot(chan_gen[order], label="sd_gen (vs residue)", c="tab:orange")
             ax.plot(chan_seed[order], label="sd_seed (vs seed)", c="tab:green")
-            ax.axhline(1.0, ls=":", c="gray", lw=0.8)
+            ax.axhline(m_real, ls=":", c="gray", lw=0.8)
             ax.set_xlabel("channel (sorted by sd_gen)"); ax.set_ylabel("per-channel SD (centred)")
             ax.set_title(f"spread per channel — sd_gen̄={m_gen:.2f} sd_seed̄={m_seed:.2f}")
             ax.legend(loc="best")
@@ -727,6 +789,8 @@ def main():
     pa.add_argument("--csv", default=None,
                     help="per-target metrics CSV path (default: "
                          "<out_base>/compare_all_<method>_metrics.csv)")
+    pa.add_argument("--n_null", type=int, default=20,
+                    help="other proteins averaged for cos_null per target (default 20)")
     pa.add_argument("--seed", type=int, default=0)
     pa.set_defaults(func=plot_all)
 
