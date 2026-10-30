@@ -32,21 +32,35 @@ def _targets_from_csv(csv_path):
 
 
 def _depth_and_len(a3m):
-    """(MSA depth, query ungapped length) from an a3m; (0, 0) if empty.
+    """(depth, uniq, query length) from an a3m; (0, 0, 0) if empty.
 
-    depth EXCLUDES the query (first record): depth = #records − 1, so a
-    query-only a3m has depth 0 (no homologs).
+    a3m files are often a CONCATENATION of several MSA searches, each carrying
+    its OWN copy of the query as a record — so the query header can appear more
+    than once. We identify the query by the FIRST header name and drop EVERY
+    record with that name (not just record 0):
+        depth = homolog records, all query copies removed
+        uniq  = depth after de-duplicating identical (ungapped) sequences
     """
-    n, first = 0, None
+    headers, seqs, first = [], [], None
+    cur = None
     with open(a3m) as fh:
         for line in fh:
             if line.startswith(">"):
-                n += 1
-            elif line.strip() and first is None:
-                first = line.strip()
-    depth = max(n - 1, 0)                         # drop the query
+                cur = line[1:].strip().split()[0]      # accession / name
+                headers.append(cur)
+            elif line.strip():
+                s = line.strip()
+                seqs.append((cur, s))
+                if first is None:
+                    first = s
+    if not headers:
+        return 0, 0, 0
+    qname = headers[0]                                  # target id == the query
+    hits = [s for h, s in seqs if h != qname]           # drop all query copies
+    depth = len(hits)
+    uniq = len({s.replace("-", "").upper() for s in hits})
     qlen = len(first.replace("-", "")) if first else 0
-    return depth, qlen
+    return depth, uniq, qlen
 
 
 def main():
@@ -64,15 +78,15 @@ def main():
     n_missing = 0
     with open(args.out, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["target", "depth", "L"])
+        w.writerow(["target", "depth", "uniq", "L"])
         for t in targets:
             a3m = Path(args.a3m_dir) / f"{t}.a3m"
             if a3m.is_file():
-                depth, qlen = _depth_and_len(a3m)
+                depth, uniq, qlen = _depth_and_len(a3m)
             else:
-                depth, qlen = 0, 0
+                depth, uniq, qlen = 0, 0, 0
                 n_missing += 1
-            w.writerow([t, depth, qlen])
+            w.writerow([t, depth, uniq, qlen])
 
     print(f"wrote {args.out}  ({len(targets)} targets"
           + (f", {n_missing} with no a3m → depth 0)" if n_missing else ")"))
