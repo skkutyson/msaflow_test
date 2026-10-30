@@ -778,7 +778,8 @@ def link_protenix_checkpoint(repo_dir, protenix_root, model_name) -> None:
         logger.info("Linked Protenix checkpoint: %s -> %s", expected, actual)
 
 
-def run_ost_scoring(output_dir, mode, target_names, gt_dir, chain_csv, out_csv) -> None:
+def run_ost_scoring(output_dir, mode, target_names, gt_dir, chain_csv, out_csv,
+                    score_full_complex=False) -> None:
     """폴딩 후 예측 CIF vs GT 를 scripts/ost_score.py 로 채점."""
     repo_dir = Path(__file__).parents[2]
     if not Path(gt_dir).is_dir():
@@ -794,6 +795,8 @@ def run_ost_scoring(output_dir, mode, target_names, gt_dir, chain_csv, out_csv) 
     ]
     if chain_csv:
         cmd += ["--chain_csv", str(chain_csv)]
+    if score_full_complex:
+        cmd += ["--score_full_complex"]
     logger.info("=== OST 채점 (GT: %s) → %s", gt_dir, out_csv)
     subprocess.run(cmd, check=False)
 
@@ -856,6 +859,9 @@ def main():
                         help="폴딩을 건너뛰고 이미 생성된 folds/ 의 CIF 만 OST 채점 "
                              "(모델 로딩/GPU 불필요; ost.enable 무시하고 무조건 채점)")
     parser.add_argument("--gt_dir",          default=None)
+    parser.add_argument("--score_full_complex", action="store_true", default=False,
+                        help="OST 채점 시 '-c model:ref' chain 매핑 없이 GT 어셈블리 "
+                             "전체와 비교 (chain 매핑 자동 추정)")
     parser.add_argument("--chain_csv",       default=None)
     parser.add_argument("--ost_csv",         default=None)
     # Deprecated alias
@@ -985,7 +991,8 @@ def main():
                 scored = target_names[resolved.shard_id::resolved.num_shards]
             else:
                 scored = target_names
-            run_ost_scoring(output_dir, mode, scored, gt_dir, chain_csv, ost_csv)
+            run_ost_scoring(output_dir, mode, scored, gt_dir, chain_csv, ost_csv,
+                            score_full_complex=args.score_full_complex)
 
 
 if __name__ == "__main__":
