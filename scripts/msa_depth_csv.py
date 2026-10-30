@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Record the shallow-MSA depth of each foldbench target → CSV.
 
-depth = number of sequences in the target's a3m (same count as fold_benchmark's
-parse_a3m_seqs: one per '>' header). Targets and a3m dir default to the
+depth = number of HOMOLOG sequences in the target's a3m, i.e. records minus the
+query (the first entry) — a query-only a3m is depth 0. Targets and a3m dir default to the
 fold_benchmark config, so the output joins on `target` (pdb_id__chain_id) with
 compare_msa_emb's plot-all metrics CSV and the OST TM/lDDT scores.
 
@@ -32,14 +32,19 @@ def _targets_from_csv(csv_path):
 
 
 def _depth_and_len(a3m):
-    """(#sequences, query ungapped length) from an a3m; (0, 0) if empty."""
-    depth, first = 0, None
+    """(MSA depth, query ungapped length) from an a3m; (0, 0) if empty.
+
+    depth EXCLUDES the query (first record): depth = #records − 1, so a
+    query-only a3m has depth 0 (no homologs).
+    """
+    n, first = 0, None
     with open(a3m) as fh:
         for line in fh:
             if line.startswith(">"):
-                depth += 1
+                n += 1
             elif line.strip() and first is None:
                 first = line.strip()
+    depth = max(n - 1, 0)                         # drop the query
     qlen = len(first.replace("-", "")) if first else 0
     return depth, qlen
 
