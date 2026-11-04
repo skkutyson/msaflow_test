@@ -110,7 +110,7 @@ def pick(env, key, default=None):
 
 decoder_ckpt   = pick("DECODER_CKPT",   "model.decoder_ckpt")
 latent_fm_ckpt = pick("LATENT_FM_CKPT", "model.latent_fm_ckpt")
-shallow_dir    = pick("SHALLOW_MSA_DIR", "run.shallow_msa_dir")
+shallow_dir    = pick("SHALLOW_MSA_DIR", "targets.shallow_msa_dir")
 targets_csv    = pick("TARGETS_CSV",     "targets.csv")
 for label, val in [("decoder_ckpt", decoder_ckpt), ("latent_fm_ckpt", latent_fm_ckpt),
                    ("shallow_msa_dir", shallow_dir), ("targets.csv", targets_csv)]:
