@@ -146,8 +146,8 @@ OpenFold A3M 파일을 읽어 Protenix MSA embedding (L×128)과 ESM2 query embe
 
 ```bash
 # 경로를 환경변수로 지정
-A3M_DIR=/gpfs/database/openfold/uniclust30 \
-OUTPUT_STORE=/store/yjlee4/msaflow_openfold \
+A3M_DIR=/PATH/TO/openfold/uniclust30 \
+OUTPUT_STORE=/PATH/TO/shardstore \
 SHARD_MAX_GB=4 \
 sbatch scripts/preprocess.sh
 ```
@@ -159,9 +159,9 @@ sbatch scripts/preprocess.sh
 ### Step 2. SFM Decoder 학습
 
 ```bash
-STORE_PATH=/store/yjlee4/msaflow_openfold \
-VAL_STORE_PATH=/store/yjlee4/msaflow_fold \
-OUTPUT_DIR=/store/runs/decoder \
+STORE_PATH=/PATH/TO/shardstore \
+VAL_STORE_PATH=/PATH/TO/val_shardstore \
+OUTPUT_DIR=/PATH/TO/runs/decoder \
 sbatch scripts/train_decoder.sh
 ```
 
@@ -177,8 +177,8 @@ sbatch scripts/train_decoder.sh
 ### Step 3. Latent FM 학습
 
 ```bash
-STORE_PATH=/store/yjlee4/msaflow_openfold \
-OUTPUT_DIR=/store/runs/latent_fm \
+STORE_PATH=/PATH/TO/shardstore \
+OUTPUT_DIR=/PATH/TO/runs/latent_fm \
 sbatch scripts/train_latent_fm.sh
 ```
 
@@ -207,8 +207,8 @@ sbatch --dependency=afterok:$JID2 scripts/train_latent_fm.sh
 
 ```bash
 python -m msaflow.data.preprocessing \
-  --a3m_dir      /gpfs/database/openfold/uniclust30 \
-  --output       /store/yjlee4/msaflow_openfold \
+  --a3m_dir      /PATH/TO/openfold/uniclust30 \
+  --output       /PATH/TO/shardstore \
   --protenix_checkpoint /models/protenix.ckpt \
   --max_msa_seqs 512 \
   --max_seq_len  1024 \
@@ -226,7 +226,7 @@ accelerate launch \
   --config_file msaflow/configs/accelerate_2gpu.yaml \
   msaflow/training/train_decoder.py \
   --config      msaflow/configs/decoder.yaml \
-  --store_path  /store/yjlee4/msaflow_openfold \
+  --store_path  /PATH/TO/shardstore \
   --output_dir  /runs/decoder
 ```
 
@@ -237,7 +237,7 @@ accelerate launch \
   --config_file msaflow/configs/accelerate_2gpu.yaml \
   msaflow/training/train_latent_fm.py \
   --config      msaflow/configs/latent_fm.yaml \
-  --store_path  /store/yjlee4/msaflow_openfold \
+  --store_path  /PATH/TO/shardstore \
   --output_dir  /runs/latent_fm
 ```
 
