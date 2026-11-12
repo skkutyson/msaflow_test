@@ -128,31 +128,39 @@ cd esm && pip install -e . && cd ..
 ```
 A3M 파일 (uniclust30)
     ↓  Step 1. preprocess.sh
-msaflow.lmdb
+ShardStore 디렉토리 (msaflow_openfold/)
     ↓  Step 2. train_decoder.sh
 decoder_ema_final.pt
     ↓  Step 3. train_latent_fm.sh
 latent_fm_ema_final.pt
 ```
 
-### Step 1. 전처리 — LMDB 빌드
+> **저장 포맷:** 전처리 산출물은 LMDB가 아니라 **ShardStore**입니다 — append-only 바이너리
+> 샤드들의 디렉토리(`msaflow.data.shard_store`)로, NFS/GPFS에서 안전하지 않던 기존 LMDB를
+> 대체했습니다. `--output`/`OUTPUT_STORE`는 `.lmdb` 파일이 아니라 디렉토리 경로입니다.
 
-OpenFold A3M 파일을 읽어 Protenix MSA embedding (L×128)과 ESM2 query embedding (L×1280)을 LMDB로 저장합니다.
+### Step 1. 전처리 — ShardStore 빌드
+
+OpenFold A3M 파일을 읽어 Protenix MSA embedding (L×128)과 ESM2 query embedding (L×1280)을
+샤드 디렉토리로 저장합니다.
 
 ```bash
 # 경로를 환경변수로 지정
-A3M_DIR=/store/database/openfold/uniclust30 \
-OUTPUT_LMDB=/store/msaflow.lmdb \
-PROTENIX_CKPT=/path/to/protenix.ckpt \
+A3M_DIR=/gpfs/database/openfold/uniclust30 \
+OUTPUT_STORE=/store/yjlee4/msaflow_openfold \
+SHARD_MAX_GB=4 \
 sbatch scripts/preprocess.sh
 ```
 
-> `PROTENIX_CKPT` 생략 시 ESM2 embedding만 저장됩니다 (decoder 학습에는 Protenix embedding이 필요합니다).
+> Protenix 체크포인트 경로는 스크립트 내부에서 컨테이너 경로로 고정됩니다(`checkpoints/...pt`).
+> 체크포인트 없이 돌리면 ESM2 embedding만 저장되는데, decoder 학습에는 Protenix embedding이
+> 필요합니다. `RESUME=1`(기본)이면 이미 처리된 키를 건너뛰고 이어서 씁니다.
 
 ### Step 2. SFM Decoder 학습
 
 ```bash
-LMDB_PATH=/store/msaflow.lmdb \
+STORE_PATH=/store/yjlee4/msaflow_openfold \
+VAL_STORE_PATH=/store/yjlee4/msaflow_fold \
 OUTPUT_DIR=/store/runs/decoder \
 sbatch scripts/train_decoder.sh
 ```
@@ -169,7 +177,7 @@ sbatch scripts/train_decoder.sh
 ### Step 3. Latent FM 학습
 
 ```bash
-LMDB_PATH=/store/msaflow.lmdb \
+STORE_PATH=/store/yjlee4/msaflow_openfold \
 OUTPUT_DIR=/store/runs/latent_fm \
 sbatch scripts/train_latent_fm.sh
 ```
@@ -195,17 +203,21 @@ sbatch --dependency=afterok:$JID2 scripts/train_latent_fm.sh
 
 ## Quick Start (SLURM 없이 직접 실행)
 
-### 1. Build the LMDB dataset
+### 1. Build the ShardStore dataset
 
 ```bash
 python -m msaflow.data.preprocessing \
-  --a3m_dir      /store/database/openfold/uniclust30 \
-  --output       /store/msaflow.lmdb \
+  --a3m_dir      /gpfs/database/openfold/uniclust30 \
+  --output       /store/yjlee4/msaflow_openfold \
   --protenix_checkpoint /models/protenix.ckpt \
   --max_msa_seqs 512 \
   --max_seq_len  1024 \
+  --shard_max_gb 4 \
   --device       cuda
 ```
+
+> `--output`은 ShardStore 디렉토리입니다(`.lmdb` 파일 아님). `--resume`로 이어쓰기,
+> `--shard_max_gb`로 샤드 크기 상한(기본 4GB)을 조절합니다.
 
 ### 2. Train the SFM decoder
 
@@ -214,7 +226,7 @@ accelerate launch \
   --config_file msaflow/configs/accelerate_2gpu.yaml \
   msaflow/training/train_decoder.py \
   --config      msaflow/configs/decoder.yaml \
-  --lmdb_path   /store/msaflow.lmdb \
+  --store_path  /store/yjlee4/msaflow_openfold \
   --output_dir  /runs/decoder
 ```
 
@@ -225,7 +237,7 @@ accelerate launch \
   --config_file msaflow/configs/accelerate_2gpu.yaml \
   msaflow/training/train_latent_fm.py \
   --config      msaflow/configs/latent_fm.yaml \
-  --lmdb_path   /store/msaflow.lmdb \
+  --store_path  /store/yjlee4/msaflow_openfold \
   --output_dir  /runs/latent_fm
 ```
 
@@ -447,7 +459,6 @@ L_RFM(θ) = E_{t, z₀, z₁}[ ‖v_θ(zₜ, e, t) − (z₀ − z₁)‖² ]
 | PyTorch | ≥2.1 | Core deep learning |
 | Accelerate | ≥0.26 | Distributed training |
 | OmegaConf | ≥2.3 | Configuration |
-| lmdb | ≥1.4 | Dataset storage |
 | fair-esm | — | ESM2-650M embeddings |
 | Protenix | — | AF3 MSAModule encoder |
 
