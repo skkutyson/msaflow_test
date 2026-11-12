@@ -371,18 +371,6 @@ uv run python scripts/run_multimodel.py collect -c configs/multimodel.yaml [-o s
 
 ---
 
-## Execution Notes (실행 환경 메모)
-
-- **GPU 작업은 반드시 컴퓨트 노드에서** 실행합니다 (로그인 노드 금지). 스크립트는 `nvidia-smi`
-  존재를 확인하고, 없으면 `srun --gres=gpu:...`를 안내하며 종료합니다.
-- `run_multimodel.py`는 `uv run`으로 호출하므로 venv 수동 활성화가 필요 없습니다 (리포 루트에서 실행).
-- 용량 이슈로 MSA·폴드·CSV 산출물은 `/store/yjlee4/...`에 저장합니다 (GPU 노드에서만 마운트됨).
-- AF3 가중치는 첫 사용 시 자동 다운로드되지만 **오프라인 노드에서는 실패**하므로, 인터넷이 되는
-  노드에서 미리 받아 `--model-dir`로 지정합니다 (`multimodel.yaml` 주석 참고).
-  `alphafold3`만 `--accept-alphafold3-terms` 동의가 필요합니다(비상업용).
-
----
-
 ## Key Results (from paper)
 
 ### MSA Autoencoding (CAMEO benchmark, 50 proteins)
