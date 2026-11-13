@@ -87,6 +87,9 @@ def main() -> None:
                          "(0 = no cap; depth column is always the true count)")
     ap.add_argument("--seed", type=int, default=0, help="Subsampling RNG seed")
     ap.add_argument("-o", "--out_csv", default="neff_by_target.csv")
+    ap.add_argument("--resume", action="store_true",
+                    help="Keep an existing --out_csv, skip targets already in it, "
+                         "and append the rest (rows are flushed per target)")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -94,45 +97,67 @@ def main() -> None:
     if not gen_files:
         sys.exit(f"ERROR: no *.a3m in {args.gen_dir}")
 
-    rows = []
-    for gen_path in gen_files:
-        target = gen_path.stem
+    fields = ["target", "source", "depth", "neff", "neff_per_sqrtL"]
+    out_path = Path(args.out_csv)
 
-        # ── origin (shallow) MSA ──────────────────────────────────────────────
-        origin_path = Path(args.origin_dir) / f"{target}.a3m"
-        if origin_path.exists():
-            origin_seqs = [s for _, s in parse_records(str(origin_path))]
-            d, L, ne, nen = neff_stats(origin_seqs, args.threshold, args.block,
-                                       args.max_seqs, rng)
-            rows.append({"target": target, "source": "origin", "depth": d,
-                         "neff": round(ne, 3), "neff_per_sqrtL": round(nen, 4)})
-        else:
-            rows.append({"target": target, "source": "origin", "depth": 0,
-                         "neff": 0.0, "neff_per_sqrtL": 0.0})
+    # ── resume: targets already written are skipped ──────────────────────────
+    done: set[str] = set()
+    if args.resume and out_path.exists() and out_path.stat().st_size > 0:
+        with open(out_path, newline="") as fh:
+            done = {r["target"] for r in csv.DictReader(fh) if r.get("target")}
+        print(f"[resume] {len(done)} targets already in {out_path} — skipping", flush=True)
 
-        # ── per-seed generated blocks (skip the leading query record) ─────────
-        by_seed: dict[int, list[str]] = {}
-        for header, seq in parse_records(str(gen_path)):
-            m = SEED_RE.search(header)
-            if m:
-                by_seed.setdefault(int(m.group(1)), []).append(seq)
-        for seed in sorted(by_seed):
-            d, L, ne, nen = neff_stats(by_seed[seed], args.threshold, args.block,
-                                       args.max_seqs, rng)
-            rows.append({"target": target, "source": f"seed{seed + 1:02d}",
-                         "depth": d, "neff": round(ne, 3),
-                         "neff_per_sqrtL": round(nen, 4)})
+    # append when resuming onto a non-empty file, otherwise start fresh
+    append = args.resume and out_path.exists() and out_path.stat().st_size > 0
+    fh = open(out_path, "a" if append else "w", newline="")
+    writer = csv.DictWriter(fh, fieldnames=fields)
+    if not append:
+        writer.writeheader()
+        fh.flush()
 
-        n_seed = len(by_seed)
-        print(f"{target:28s}  origin={'Y' if origin_path.exists() else 'N'}  "
-              f"seeds={n_seed}", flush=True)
+    n_tgt = 0
+    try:
+        for gen_path in gen_files:
+            target = gen_path.stem
+            if target in done:
+                continue
 
-    with open(args.out_csv, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=["target", "source", "depth",
-                                           "neff", "neff_per_sqrtL"])
-        w.writeheader()
-        w.writerows(rows)
-    print(f"\nwrote {args.out_csv}  ({len(rows)} rows, {len(gen_files)} targets)")
+            target_rows = []
+            # ── origin (shallow) MSA ─────────────────────────────────────────
+            origin_path = Path(args.origin_dir) / f"{target}.a3m"
+            if origin_path.exists():
+                origin_seqs = [s for _, s in parse_records(str(origin_path))]
+                d, L, ne, nen = neff_stats(origin_seqs, args.threshold, args.block,
+                                           args.max_seqs, rng)
+                target_rows.append({"target": target, "source": "origin", "depth": d,
+                                    "neff": round(ne, 3), "neff_per_sqrtL": round(nen, 4)})
+            else:
+                target_rows.append({"target": target, "source": "origin", "depth": 0,
+                                    "neff": 0.0, "neff_per_sqrtL": 0.0})
+
+            # ── per-seed generated blocks (skip the leading query record) ────
+            by_seed: dict[int, list[str]] = {}
+            for header, seq in parse_records(str(gen_path)):
+                m = SEED_RE.search(header)
+                if m:
+                    by_seed.setdefault(int(m.group(1)), []).append(seq)
+            for seed in sorted(by_seed):
+                d, L, ne, nen = neff_stats(by_seed[seed], args.threshold, args.block,
+                                           args.max_seqs, rng)
+                target_rows.append({"target": target, "source": f"seed{seed + 1:02d}",
+                                    "depth": d, "neff": round(ne, 3),
+                                    "neff_per_sqrtL": round(nen, 4)})
+
+            writer.writerows(target_rows)
+            fh.flush()
+            n_tgt += 1
+            print(f"{target:28s}  origin={'Y' if origin_path.exists() else 'N'}  "
+                  f"seeds={len(by_seed)}", flush=True)
+    finally:
+        fh.close()
+
+    print(f"\nwrote {out_path}  (+{n_tgt} targets this run, "
+          f"{len(done) + n_tgt} total)")
 
 
 if __name__ == "__main__":
